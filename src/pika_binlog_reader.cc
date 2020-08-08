@@ -52,12 +52,14 @@ bool PikaBinlogReader::ReadToTheEnd() {
 }
 
 int PikaBinlogReader::Seek(std::shared_ptr<Binlog> logger, uint32_t filenum, uint64_t offset) {
-  std::string confile = NewFileName(logger->filename, filenum);
+  std::string confile = NewFileName(logger->filename(), filenum);
   if (!slash::FileExists(confile)) {
+    LOG(WARNING) << confile << " not exits";
     return -1;
   }
   slash::SequentialFile* readfile;
   if (!slash::NewSequentialFile(confile, &readfile).ok()) {
+    LOG(WARNING) << "New swquential " << confile << " failed";
     return -1;
   }
   if (queue_) {
@@ -126,6 +128,10 @@ bool PikaBinlogReader::GetNext(uint64_t* size) {
       s = queue_->Read(length, &buffer_, backing_store_);
       offset += kHeaderSize + length;
     } else if (type == kLastType) {
+      s = queue_->Read(length, &buffer_, backing_store_);
+      offset += kHeaderSize + length;
+      break;
+    } else if (type == kBadRecord) {
       s = queue_->Read(length, &buffer_, backing_store_);
       offset += kHeaderSize + length;
       break;
@@ -205,6 +211,7 @@ Status PikaBinlogReader::Consume(std::string* scratch, uint32_t* filenum, uint64
       case kEof:
         return Status::EndFile("Eof");
       case kBadRecord:
+        LOG(WARNING) << "Read BadRecord record, will decode failed, this record may dbsync padded record, not processed here";
         return Status::IOError("Data Corruption");
       case kOldRecord:
         return Status::EndFile("Eof");
@@ -235,7 +242,7 @@ Status PikaBinlogReader::Get(std::string* scratch, uint32_t* filenum, uint64_t* 
     }
     s = Consume(scratch, filenum, offset);
     if (s.IsEndFile()) {
-      std::string confile = NewFileName(logger_->filename, cur_filenum_ + 1);
+      std::string confile = NewFileName(logger_->filename(), cur_filenum_ + 1);
 
       // sleep 10ms wait produce thread generate the new binlog
       usleep(10000);

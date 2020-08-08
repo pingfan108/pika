@@ -24,6 +24,11 @@ class BitGetCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr) override;
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new BitGetCmd(*this);
+  }
  private:
   std::string key_;
   int64_t  bit_offset_;
@@ -44,6 +49,11 @@ class BitSetCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr) override;
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new BitSetCmd(*this);
+  }
  private:
   std::string key_;
   int64_t  bit_offset_;
@@ -66,6 +76,11 @@ class BitCountCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr) override;
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new BitCountCmd(*this);
+  }
  private:
   std::string key_;
   bool  count_all_;
@@ -90,6 +105,11 @@ class BitPosCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr) override;
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new BitPosCmd(*this);
+  }
  private:
   std::string key_;
   bool  pos_all_;
@@ -113,6 +133,11 @@ class BitOpCmd : public Cmd {
   BitOpCmd(const std::string& name, int arity, uint16_t flag)
         : Cmd(name, arity, flag) {};
   virtual void Do(std::shared_ptr<Partition> partition = nullptr) override;
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new BitOpCmd(*this);
+  }
  private:
   std::string dest_key_;
   std::vector<std::string> src_keys_;

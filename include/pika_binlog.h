@@ -6,6 +6,8 @@
 #ifndef PIKA_BINLOG_H_
 #define PIKA_BINLOG_H_
 
+#include <atomic>
+
 #include "slash/include/env.h"
 #include "slash/include/slash_mutex.h"
 #include "slash/include/slash_status.h"
@@ -30,6 +32,7 @@ class Version {
   uint32_t pro_num_;
   uint64_t pro_offset_;
   uint64_t logic_id_;
+  uint32_t term_;
 
   pthread_rwlock_t rwlock_;
 
@@ -56,25 +59,45 @@ class Binlog {
   void Unlock()       { mutex_.Unlock(); }
 
   Status Put(const std::string &item);
-  Status Put(const char* item, int len);
 
-  Status GetProducerStatus(uint32_t* filenum, uint64_t* pro_offset, uint64_t* logic_id = NULL);
+  Status GetProducerStatus(uint32_t* filenum, uint64_t* pro_offset, uint32_t* term = NULL, uint64_t* logic_id = NULL);
   /*
    * Set Producer pro_num and pro_offset with lock
    */
-  Status SetProducerStatus(uint32_t filenum, uint64_t pro_offset);
-
-  static Status AppendPadding(slash::WritableFile* file, uint64_t* len);
-
-  slash::WritableFile *queue() { return queue_; }
+  Status SetProducerStatus(uint32_t filenum, uint64_t pro_offset, uint32_t term = 0, uint64_t index = 0);
+  // Need to hold Lock();
+  Status Truncate(uint32_t pro_num, uint64_t pro_offset, uint64_t index);
 
   uint64_t file_size() {
     return file_size_;
   }
 
-  std::string filename;
+  std::string filename() {
+    return filename_;
+  }
+
+  bool IsBinlogIoError() {
+    return binlog_io_error_;
+  }
+
+  // need to hold mutex_
+  void SetTerm(uint32_t term) {
+    slash::RWLock(&(version_->rwlock_), true);
+    version_->term_ = term;
+    version_->StableSave();
+  }
+
+  uint32_t term() {
+    slash::RWLock(&(version_->rwlock_), true);
+    return version_->term_;
+  }
+
+  void Close();
 
  private:
+  Status Put(const char* item, int len);
+  static Status AppendPadding(slash::WritableFile* file, uint64_t* len);
+  //slash::WritableFile *queue() { return queue_; }
 
   void InitLogFile();
   Status EmitPhysicalRecord(RecordType t, const char *ptr, size_t n, int *temp_pro_offset);
@@ -85,8 +108,7 @@ class Binlog {
    */
   Status Produce(const Slice &item, int *pro_offset);
 
-  uint32_t consumer_num_;
-  uint64_t item_num_;
+  std::atomic<bool> opened_;
 
   Version* version_;
   slash::WritableFile *queue_;
@@ -104,6 +126,9 @@ class Binlog {
 
   uint64_t file_size_;
 
+  std::string filename_;
+
+  std::atomic<bool> binlog_io_error_;
   // Not use
   //int32_t retry_;
 

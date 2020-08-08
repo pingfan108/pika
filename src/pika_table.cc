@@ -7,8 +7,10 @@
 
 #include "include/pika_server.h"
 #include "include/pika_cmd_table_manager.h"
+#include "include/pika_rm.h"
 
 extern PikaServer* g_pika_server;
+extern PikaReplicaManager* g_pika_rm;
 extern PikaCmdTableManager* g_pika_cmd_table_manager;
 
 std::string TablePath(const std::string& path,
@@ -30,6 +32,8 @@ Table::Table(const std::string& table_name,
 
   slash::CreatePath(db_path_);
   slash::CreatePath(log_path_);
+
+  binlog_io_error_.store(false);
 
   pthread_rwlock_init(&partitions_rw_, NULL);
 }
@@ -82,14 +86,12 @@ bool Table::FlushPartitionSubDB(const std::string& db_name) {
   return true;
 }
 
+void Table::SetBinlogIoError() {
+  return binlog_io_error_.store(true);
+}
+
 bool Table::IsBinlogIoError() {
-  slash::RWLock l(&partitions_rw_, false);
-  for (const auto& item : partitions_) {
-    if (item.second->IsBinlogIoError()) {
-      return true;
-    }
-  }
-  return false;
+  return binlog_io_error_.load();
 }
 
 uint32_t Table::PartitionNum() {
@@ -110,7 +112,7 @@ Status Table::AddPartitions(const std::set<uint32_t>& partition_ids) {
 
   for (const uint32_t& id : partition_ids) {
     partitions_.emplace(id, std::make_shared<Partition>(
-          table_name_, id, db_path_, log_path_));
+          table_name_, id, db_path_));
   }
   return Status::OK();
 }
@@ -128,6 +130,13 @@ Status Table::RemovePartitions(const std::set<uint32_t>& partition_ids) {
     partitions_.erase(id);
   }
   return Status::OK();
+}
+
+void Table::GetAllPartitions(std::set<uint32_t>& partition_ids) {
+  slash::RWLock l(&partitions_rw_, false);
+  for (const auto& iter : partitions_) {
+    partition_ids.insert(iter.first);
+  }
 }
 
 void Table::KeyScan() {
@@ -258,4 +267,32 @@ std::shared_ptr<Partition> Table::GetPartitionByKey(const std::string& key) {
   slash::RWLock rwl(&partitions_rw_, false);
   auto iter = partitions_.find(index);
   return (iter == partitions_.end()) ? NULL : iter->second;
+}
+
+bool Table::TableIsEmpty() {
+  slash::RWLock rwl(&partitions_rw_, false);
+  return partitions_.empty();
+}
+
+Status Table::Leave() {
+  if (!TableIsEmpty()) {
+    return Status::Corruption("Table have partitions!");
+  }
+  return MovetoToTrash(db_path_);
+}
+
+Status Table::MovetoToTrash(const std::string& path) {
+
+  std::string path_tmp = path;
+  if (path_tmp[path_tmp.length() - 1] == '/') {
+    path_tmp.erase(path_tmp.length() - 1);
+  }
+  path_tmp += "_deleting/";
+  if (slash::RenameFile(path, path_tmp)) {
+    LOG(WARNING) << "Failed to move " << path  <<" to trash, error: " << strerror(errno);
+    return Status::Corruption("Failed to move %s to trash", path);
+  }
+  g_pika_server->PurgeDir(path_tmp);
+  LOG(WARNING) << path << " move to trash success";
+  return Status::OK();
 }

@@ -58,6 +58,11 @@ class GeoAddCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new GeoAddCmd(*this);
+  }
  private:
   std::string key_;
   std::vector<GeoPoint> pos_;
@@ -74,6 +79,11 @@ class GeoPosCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new GeoPosCmd(*this);
+  }
  private:
   std::string key_;
   std::vector<std::string> members_;
@@ -90,6 +100,11 @@ class GeoDistCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new GeoDistCmd(*this);
+  }
  private:
   std::string key_, first_pos_, second_pos_, unit_;
   virtual void DoInitial();
@@ -105,6 +120,11 @@ class GeoHashCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new GeoHashCmd(*this);
+  }
  private:
   std::string key_;
   std::vector<std::string> members_;
@@ -116,6 +136,11 @@ class GeoRadiusCmd : public Cmd {
   GeoRadiusCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new GeoRadiusCmd(*this);
+  }
  private:
   std::string key_;
   GeoRange range_;
@@ -138,6 +163,11 @@ class GeoRadiusByMemberCmd : public Cmd {
   GeoRadiusByMemberCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new GeoRadiusByMemberCmd(*this);
+  }
  private:
   std::string key_;
   GeoRange range_;

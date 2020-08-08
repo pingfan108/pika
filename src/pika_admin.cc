@@ -25,6 +25,24 @@ extern PikaServer *g_pika_server;
 extern PikaConf *g_pika_conf;
 extern PikaReplicaManager *g_pika_rm;
 
+static std::string ConstructPinginPubSubResp(const PikaCmdArgsType &argv) {
+  if (argv.size() > 2) {
+    return "-ERR wrong number of arguments for " + kCmdNamePing +
+           " command\r\n";
+  }
+  std::stringstream resp;
+
+  resp << "*2\r\n"
+       << "$4\r\n"
+       << "pong\r\n";
+  if (argv.size() == 2) {
+    resp << "$" << argv[1].size() << "\r\n" << argv[1] << "\r\n";
+  } else {
+    resp << "$0\r\n\r\n";
+  }
+  return resp.str();
+}
+
 /*
  * slaveof no one
  * slaveof ip port
@@ -32,6 +50,11 @@ extern PikaReplicaManager *g_pika_rm;
  */
 void SlaveofCmd::DoInitial() {
   if (!CheckArg(argv_.size())) {
+    res_.SetRes(CmdRes::kWrongNum, kCmdNameSlaveof);
+    return;
+  }
+
+  if (argv_.size() > 4) {
     res_.SetRes(CmdRes::kWrongNum, kCmdNameSlaveof);
     return;
   }
@@ -83,14 +106,16 @@ void SlaveofCmd::Do(std::shared_ptr<Partition> partition) {
 
   if (is_noone_) {
     res_.SetRes(CmdRes::kOk);
+    g_pika_conf->SetSlaveof(std::string());
     return;
   }
 
   bool sm_ret = g_pika_server->SetMaster(master_ip_, master_port_);
-  
+
   if (sm_ret) {
     res_.SetRes(CmdRes::kOk);
     g_pika_conf->SetSlaveof(master_ip_ + ":" + std::to_string(master_port_));
+    g_pika_server->SetFirstMetaSync(true);
   } else {
     res_.SetRes(CmdRes::kErrOther, "Server is not in correct state for slaveof");
   }
@@ -114,6 +139,11 @@ void DbSlaveofCmd::DoInitial() {
   if (g_pika_server->role() ^ PIKA_ROLE_SLAVE
     || !g_pika_server->MetaSyncDone()) {
     res_.SetRes(CmdRes::kErrOther, "Not currently a slave");
+    return;
+  }
+
+  if (argv_.size() > 4) {
+    res_.SetRes(CmdRes::kWrongNum, kCmdNameDbSlaveof);
     return;
   }
 
@@ -150,7 +180,7 @@ void DbSlaveofCmd::DoInitial() {
 
 void DbSlaveofCmd::Do(std::shared_ptr<Partition> partition) {
   std::shared_ptr<SyncSlavePartition> slave_partition =
-      g_pika_rm->GetSyncSlavePartitionByName(PartitionInfo(db_name_,0));
+      g_pika_rm->GetSyncSlavePartitionByName(PartitionInfo(db_name_, 0));
   if (!slave_partition) {
     res_.SetRes(CmdRes::kErrOther, "Db not found");
     return;
@@ -162,11 +192,12 @@ void DbSlaveofCmd::Do(std::shared_ptr<Partition> partition) {
     s = g_pika_rm->SendRemoveSlaveNodeRequest(db_name_, 0);
   } else {
     if (slave_partition->State() == ReplState::kNoConnect
-      || slave_partition->State() == ReplState::kError) {
+      || slave_partition->State() == ReplState::kError
+      || slave_partition->State() == ReplState::kDBNoConnect) {
       if (have_offset_) {
-        std::shared_ptr<Partition> db_partition =
-          g_pika_server->GetPartitionByDbName(db_name_);
-        db_partition->logger()->SetProducerStatus(filenum_, offset_);
+        std::shared_ptr<SyncMasterPartition> db_partition =
+          g_pika_rm->GetSyncMasterPartitionByName(PartitionInfo(db_name_, 0));
+        db_partition->Logger()->SetProducerStatus(filenum_, offset_);
       }
       ReplState state = force_sync_
           ? ReplState::kTryDBSync : ReplState::kTryConnect;
@@ -207,7 +238,17 @@ void AuthCmd::Do(std::shared_ptr<Partition> partition) {
   }
   if (res_.none()) {
     res_.SetRes(CmdRes::kInvalidPwd);
+    return;
   }
+
+  std::shared_ptr<pink::PinkConn> conn = GetConn();
+  if (!conn) {
+    res_.SetRes(CmdRes::kErrOther, kCmdNamePing);
+    LOG(WARNING) << name_  << " weak ptr is empty";
+    return;
+  }
+  std::shared_ptr<PikaClientConn> cli_conn = std::dynamic_pointer_cast<PikaClientConn>(conn);
+  cli_conn->auth_stat().ChecknUpdate(res().raw_message());
 }
 
 void BgsaveCmd::DoInitial() {
@@ -315,11 +356,11 @@ void PurgelogstoCmd::DoInitial() {
 }
 
 void PurgelogstoCmd::Do(std::shared_ptr<Partition> partition) {
-  std::shared_ptr<Partition> table_partition = g_pika_server->GetTablePartitionById(table_, 0);
-  if (!table_partition) {
+  std::shared_ptr<SyncMasterPartition> sync_partition = g_pika_rm->GetSyncMasterPartitionByName(PartitionInfo(table_, 0));
+  if (!sync_partition) {
     res_.SetRes(CmdRes::kErrOther, "Partition not found");
   } else {
-    table_partition->PurgeLogs(num_, true);
+    sync_partition->StableLogger()->PurgeStableLogs(num_, true);
     res_.SetRes(CmdRes::kOk);
   }
 }
@@ -332,6 +373,17 @@ void PingCmd::DoInitial() {
 }
 
 void PingCmd::Do(std::shared_ptr<Partition> partition) {
+  std::shared_ptr<pink::PinkConn> conn = GetConn();
+  if (!conn) {
+    res_.SetRes(CmdRes::kErrOther, kCmdNamePing);
+    LOG(WARNING) << name_  << " weak ptr is empty";
+    return;
+  }
+  std::shared_ptr<PikaClientConn> cli_conn = std::dynamic_pointer_cast<PikaClientConn>(conn);
+
+  if (cli_conn->IsPubSub()) {
+    return res_.SetRes(CmdRes::kNone, ConstructPinginPubSubResp(argv_));
+  }
   res_.SetRes(CmdRes::kPong);
 }
 
@@ -340,9 +392,34 @@ void SelectCmd::DoInitial() {
     res_.SetRes(CmdRes::kWrongNum, kCmdNameSelect);
     return;
   }
+  int index = atoi(argv_[1].data());
+  if (std::to_string(index) != argv_[1]) {
+    res_.SetRes(CmdRes::kInvalidIndex, kCmdNameSelect);
+    return;
+  }
+  if (g_pika_conf->classic_mode()) {
+    if (index < 0 || index >= g_pika_conf->databases()) {
+      res_.SetRes(CmdRes::kInvalidIndex, kCmdNameSelect + " DB index is out of range");
+      return;
+    }
+  }
+  table_name_ = "db" + argv_[1];
+  if (!g_pika_server->IsTableExist(table_name_)) {
+    res_.SetRes(CmdRes::kInvalidTable, kCmdNameSelect);
+    return;
+  }
 }
 
 void SelectCmd::Do(std::shared_ptr<Partition> partition) {
+  std::shared_ptr<PikaClientConn> conn =
+    std::dynamic_pointer_cast<PikaClientConn>(GetConn());
+  if (!conn) {
+    res_.SetRes(CmdRes::kErrOther, kCmdNameSelect);
+    LOG(WARNING) << name_  << " weak ptr is empty";
+    return;
+  }
+  conn->SetCurrentTable(table_name_);
+  res_.SetRes(CmdRes::kOk);
 }
 
 void FlushallCmd::DoInitial() {
@@ -362,7 +439,7 @@ void FlushallCmd::Do(std::shared_ptr<Partition> partition) {
 // flushall convert flushdb writes to every partition binlog
 std::string FlushallCmd::ToBinlog(
       uint32_t exec_time,
-      const std::string& server_id,
+      uint32_t term_id,
       uint64_t logic_id,
       uint32_t filenum,
       uint64_t offset) {
@@ -376,7 +453,7 @@ std::string FlushallCmd::ToBinlog(
   RedisAppendContent(content, flushdb_cmd);
   return PikaBinlogTransverter::BinlogEncode(BinlogType::TypeFirst,
                                              exec_time,
-                                             std::stoi(server_id),
+                                             term_id,
                                              logic_id,
                                              filenum,
                                              offset,
@@ -427,11 +504,21 @@ void ClientCmd::DoInitial() {
     return;
   }
   if (!strcasecmp(argv_[1].data(), "list") && argv_.size() == 2) {
-    //nothing
+    // nothing
+  } else if (!strcasecmp(argv_[1].data(), "list") && argv_.size() == 5) {
+    if (!strcasecmp(argv_[2].data(), "order") &&
+        !strcasecmp(argv_[3].data(), "by")) {
+      info_ = argv_[4];
+    } else {
+      res_.SetRes(CmdRes::kErrOther,
+          "Syntax error, try CLIENT (LIST [order by [addr|idle])");
+      return;
+    }
   } else if (!strcasecmp(argv_[1].data(), "kill") && argv_.size() == 3) {
-    ip_port_ = argv_[2];
+    info_ = argv_[2];
   } else {
-    res_.SetRes(CmdRes::kErrOther, "Syntax error, try CLIENT (LIST | KILL ip:port)");
+    res_.SetRes(CmdRes::kErrOther,
+        "Syntax error, try CLIENT (LIST [order by [addr|idle]| KILL ip:port)");
     return;
   }
   operation_ = argv_[1];
@@ -444,19 +531,27 @@ void ClientCmd::Do(std::shared_ptr<Partition> partition) {
     gettimeofday(&now, NULL);
     std::vector<ClientInfo> clients;
     g_pika_server->ClientList(&clients);
-    std::vector<ClientInfo>::iterator iter= clients.begin();
+    std::vector<ClientInfo>::iterator iter = clients.begin();
     std::string reply = "";
     char buf[128];
+    if (!strcasecmp(info_.data(), "addr")) {
+      std::sort(clients.begin(), clients.end(), AddrCompare);
+    } else if (!strcasecmp(info_.data(), "idle")) {
+      std::sort(clients.begin(), clients.end(), IdleCompare);
+    }
     while (iter != clients.end()) {
-      snprintf(buf, sizeof(buf), "addr=%s fd=%d idle=%ld\n", iter->ip_port.c_str(), iter->fd, iter->last_interaction == 0 ? 0 : now.tv_sec - iter->last_interaction);
+      snprintf(buf, sizeof(buf), "addr=%s fd=%d idle=%ld\n",
+         iter->ip_port.c_str(), iter->fd,
+         iter->last_interaction == 0 ? 0 : now.tv_sec - iter->last_interaction);
       reply.append(buf);
       iter++;
     }
     res_.AppendString(reply);
-  } else if (!strcasecmp(operation_.data(), "kill") && !strcasecmp(ip_port_.data(), "all")) {
+  } else if (!strcasecmp(operation_.data(), "kill") &&
+      !strcasecmp(info_.data(), "all")) {
     g_pika_server->ClientKillAll();
     res_.SetRes(CmdRes::kOk);
-  } else if (g_pika_server->ClientKill(ip_port_) == 1) {
+  } else if (g_pika_server->ClientKill(info_) == 1) {
     res_.SetRes(CmdRes::kOk);
   } else {
     res_.SetRes(CmdRes::kErrOther, "No such client");
@@ -468,6 +563,22 @@ void ShutdownCmd::DoInitial() {
   if (!CheckArg(argv_.size())) {
     res_.SetRes(CmdRes::kWrongNum, kCmdNameShutdown);
     return;
+  }
+
+  // For now, only shutdown need check local
+  if (is_local()) {
+    std::shared_ptr<pink::PinkConn> conn = GetConn();
+    if (conn) {
+      if (conn->ip_port().find("127.0.0.1") == std::string::npos
+          && conn->ip_port().find(g_pika_server->host()) == std::string::npos) {
+        LOG(WARNING) << "\'shutdown\' should be localhost" << " command from " << conn->ip_port();
+        res_.SetRes(CmdRes::kErrOther, kCmdNameShutdown + " should be localhost");
+      }
+    } else {
+      LOG(WARNING) << name_  << " weak ptr is empty";
+      res_.SetRes(CmdRes::kErrOther, kCmdNameShutdown);
+      return;
+    }
   }
 }
 // no return
@@ -482,7 +593,7 @@ const std::string InfoCmd::kAllSection = "all";
 const std::string InfoCmd::kServerSection = "server";
 const std::string InfoCmd::kClientsSection = "clients";
 const std::string InfoCmd::kStatsSection = "stats";
-const std::string InfoCmd::kExecCountSection= "command_exec_count";
+const std::string InfoCmd::kExecCountSection = "command_exec_count";
 const std::string InfoCmd::kCPUSection = "cpu";
 const std::string InfoCmd::kReplicationSection = "replication";
 const std::string InfoCmd::kKeyspaceSection = "keyspace";
@@ -498,7 +609,7 @@ void InfoCmd::DoInitial() {
   if (argc == 1) {
     info_section_ = kInfo;
     return;
-  } //then the agc is 2 or 3
+  } // then the agc is 2 or 3
 
   if (!strcasecmp(argv_[1].data(), kAllSection.data())) {
     info_section_ = kInfoAll;
@@ -696,6 +807,9 @@ void InfoCmd::InfoExecCount(std::string& info) {
 
   std::unordered_map<std::string, uint64_t> command_exec_count_table = g_pika_server->ServerExecCountTable();
   for (const auto& item : command_exec_count_table) {
+    if (item.second == 0) {
+      continue;
+    }
     tmp_stream << item.first << ":" << item.second << "\r\n";
   }
   info.append(tmp_stream.str());
@@ -739,7 +853,7 @@ void InfoCmd::InfoShardingReplication(std::string& info) {
   g_pika_rm->FindCommonMaster(&common_master);
   if (!common_master.empty()) {
     role |=  PIKA_ROLE_SLAVE;
-    if(!slash::ParseIpPortString(common_master, master_ip, master_port)) {
+    if (!slash::ParseIpPortString(common_master, master_ip, master_port)) {
       return;
     }
   }
@@ -804,6 +918,14 @@ void InfoCmd::InfoReplication(std::string& info) {
           out_of_sync << "WaitDBSync)";
         } else if (slave_partition->State() == ReplState::kError) {
           out_of_sync << "Error)";
+        } else if (slave_partition->State() == ReplState::kWaitReply) {
+          out_of_sync << "kWaitReply)";
+        } else if (slave_partition->State() == ReplState::kTryConnect) {
+          out_of_sync << "kTryConnect)";
+        } else if (slave_partition->State() == ReplState::kTryDBSync) {
+          out_of_sync << "kTryDBSync)";
+        } else if (slave_partition->State() == ReplState::kDBNoConnect) {
+          out_of_sync << "kDBNoConnect)";
         } else {
           out_of_sync << "Other)";
         }
@@ -830,7 +952,7 @@ void InfoCmd::InfoReplication(std::string& info) {
       tmp_stream << "slave_priority:" << g_pika_conf->slave_priority() << "\r\n";
       tmp_stream << "slave_read_only:" << g_pika_conf->slave_read_only() << "\r\n";
       if (!all_partition_sync) {
-        tmp_stream <<"db_repl_error_state:" << out_of_sync.str() << "\r\n";
+        tmp_stream <<"db_repl_state:" << out_of_sync.str() << "\r\n";
       }
       break;
     case PIKA_ROLE_MASTER | PIKA_ROLE_SLAVE :
@@ -840,7 +962,7 @@ void InfoCmd::InfoReplication(std::string& info) {
               && all_partition_sync) ? "up" : "down") << "\r\n";
       tmp_stream << "slave_read_only:" << g_pika_conf->slave_read_only() << "\r\n";
       if (!all_partition_sync) {
-        tmp_stream <<"db_repl_error_state:" << out_of_sync.str() << "\r\n";
+        tmp_stream <<"db_repl_state:" << out_of_sync.str() << "\r\n";
       }
     case PIKA_ROLE_SINGLE :
     case PIKA_ROLE_MASTER :
@@ -852,13 +974,26 @@ void InfoCmd::InfoReplication(std::string& info) {
   uint32_t filenum = 0;
   uint64_t offset = 0;
   std::string safety_purge;
+  std::shared_ptr<SyncMasterPartition> master_partition = nullptr;
   for (const auto& t_item : g_pika_server->tables_) {
     slash::RWLock partition_rwl(&t_item.second->partitions_rw_, false);
     for (const auto& p_item : t_item.second->partitions_) {
-      p_item.second->logger()->GetProducerStatus(&filenum, &offset);
-      tmp_stream << p_item.second->GetPartitionName() << " binlog_offset=" << filenum << " " << offset;
-      s = g_pika_rm->GetSafetyPurgeBinlogFromSMP(p_item.second->GetTableName(), p_item.second->GetPartitionId(), &safety_purge);
+      std::string table_name = p_item.second->GetTableName();
+      uint32_t partition_id = p_item.second->GetPartitionId();
+      master_partition = g_pika_rm->GetSyncMasterPartitionByName(PartitionInfo(table_name, partition_id));
+      if (!master_partition) {
+        LOG(WARNING) << "Sync Master Partition: " << table_name << ":" << partition_id
+          << ", NotFound";
+        continue;
+      }
+      master_partition->Logger()->GetProducerStatus(&filenum, &offset);
+      tmp_stream << table_name << " binlog_offset=" << filenum << " " << offset;
+      s = master_partition->GetSafetyPurgeBinlog(&safety_purge);
       tmp_stream << ",safety_purge=" << (s.ok() ? safety_purge : "error") << "\r\n";
+      if (g_pika_conf->consensus_level()) {
+        LogOffset last_log = master_partition->ConsensusLastIndex();
+        tmp_stream << table_name << " consensus last_log=" << last_log.ToString() << "\r\n";
+      }
     }
   }
 
@@ -899,11 +1034,11 @@ void InfoCmd::InfoKeyspace(std::string& info) {
         tmp_stream << "# Duration: " << std::to_string(duration) + "s" << "\r\n";
       }
 
-      tmp_stream << table_name << " Strings_keys=" << key_infos[0].keys << ", expires=" << key_infos[0].expires << ", invaild_keys=" << key_infos[0].invaild_keys << "\r\n";
-      tmp_stream << table_name << " Hashes_keys=" << key_infos[1].keys << ", expires=" << key_infos[1].expires << ", invaild_keys=" << key_infos[1].invaild_keys << "\r\n";
-      tmp_stream << table_name << " Lists_keys=" << key_infos[2].keys << ", expires=" << key_infos[2].expires << ", invaild_keys=" << key_infos[2].invaild_keys << "\r\n";
-      tmp_stream << table_name << " Zsets_keys=" << key_infos[3].keys << ", expires=" << key_infos[3].expires << ", invaild_keys=" << key_infos[3].invaild_keys << "\r\n";
-      tmp_stream << table_name << " Sets_keys=" << key_infos[4].keys << ", expires=" << key_infos[4].expires << ", invaild_keys=" << key_infos[4].invaild_keys << "\r\n\r\n";
+      tmp_stream << table_name << " Strings_keys=" << key_infos[0].keys << ", expires=" << key_infos[0].expires << ", invalid_keys=" << key_infos[0].invaild_keys << "\r\n";
+      tmp_stream << table_name << " Hashes_keys=" << key_infos[1].keys << ", expires=" << key_infos[1].expires << ", invalid_keys=" << key_infos[1].invaild_keys << "\r\n";
+      tmp_stream << table_name << " Lists_keys=" << key_infos[2].keys << ", expires=" << key_infos[2].expires << ", invalid_keys=" << key_infos[2].invaild_keys << "\r\n";
+      tmp_stream << table_name << " Zsets_keys=" << key_infos[3].keys << ", expires=" << key_infos[3].expires << ", invalid_keys=" << key_infos[3].invaild_keys << "\r\n";
+      tmp_stream << table_name << " Sets_keys=" << key_infos[4].keys << ", expires=" << key_infos[4].expires << ", invalid_keys=" << key_infos[4].invaild_keys << "\r\n\r\n";
     }
   }
   info.append(tmp_stream.str());
@@ -971,6 +1106,11 @@ void InfoCmd::InfoDebug(std::string& info) {
   tmp_stream << "# Synchronization Status" << "\r\n";
   info.append(tmp_stream.str());
   g_pika_rm->RmStatus(&info);
+
+  tmp_stream.str(std::string());
+  tmp_stream << "# Running Status " << "\r\n";
+  info.append(tmp_stream.str());
+  g_pika_server->ServerStatus(&info);
   return;
 }
 
@@ -1335,6 +1475,12 @@ void ConfigCmd::ConfigGet(std::string &ret) {
     EncodeInt64(&config_body, g_pika_conf->max_write_buffer_size());
   }
 
+  if (slash::stringmatch(pattern.data(), "max-client-response-size", 1)) {
+    elements += 2;
+    EncodeString(&config_body, "max-client-response-size");
+    EncodeInt64(&config_body, g_pika_conf->max_client_response_size());
+  }
+
   if (slash::stringmatch(pattern.data(), "compression", 1)) {
     elements += 2;
     EncodeString(&config_body, "compression");
@@ -1383,6 +1529,29 @@ void ConfigCmd::ConfigGet(std::string &ret) {
     EncodeInt32(&config_body, g_pika_conf->slave_priority());
   }
 
+  if (slash::stringmatch(pattern.data(), "sync-window-size", 1)) {
+    elements += 2;
+    EncodeString(&config_body, "sync-window-size");
+    EncodeInt32(&config_body, g_pika_conf->sync_window_size());
+  }
+
+  if (slash::stringmatch(pattern.data(), "max-conn-rbuf-size", 1)) {
+    elements += 2;
+    EncodeString(&config_body, "max-conn-rbuf-size");
+    EncodeInt32(&config_body, g_pika_conf->max_conn_rbuf_size());
+  }
+
+  if (slash::stringmatch(pattern.data(), "replication-num", 1)) {
+    elements += 2;
+    EncodeString(&config_body, "replication-num");
+    EncodeInt32(&config_body, g_pika_conf->replication_num());
+  }
+  if (slash::stringmatch(pattern.data(), "consensus-level", 1)) {
+    elements += 2;
+    EncodeString(&config_body, "consensus-level");
+    EncodeInt32(&config_body, g_pika_conf->consensus_level());
+  }
+
   std::stringstream resp;
   resp << "*" << std::to_string(elements) << "\r\n" << config_body;
   ret = resp.str();
@@ -1392,7 +1561,7 @@ void ConfigCmd::ConfigGet(std::string &ret) {
 void ConfigCmd::ConfigSet(std::string& ret) {
   std::string set_item = config_args_v_[1];
   if (set_item == "*") {
-    ret = "*21\r\n";
+    ret = "*23\r\n";
     EncodeString(&ret, "timeout");
     EncodeString(&ret, "requirepass");
     EncodeString(&ret, "masterauth");
@@ -1410,10 +1579,12 @@ void ConfigCmd::ConfigSet(std::string& ret) {
     EncodeString(&ret, "write-binlog");
     EncodeString(&ret, "max-cache-statistic-keys");
     EncodeString(&ret, "small-compaction-threshold");
+    EncodeString(&ret, "max-client-response-size");
     EncodeString(&ret, "db-sync-speed");
     EncodeString(&ret, "compact-cron");
     EncodeString(&ret, "compact-interval");
     EncodeString(&ret, "slave-priority");
+    EncodeString(&ret, "sync-window-size");
     return;
   }
   long int ival;
@@ -1526,6 +1697,13 @@ void ConfigCmd::ConfigSet(std::string& ret) {
     g_pika_conf->SetSmallCompactionThreshold(ival);
     g_pika_server->PartitionSetSmallCompactionThreshold(ival);
     ret = "+OK\r\n";
+  } else if (set_item == "max-client-response-size") {
+    if (!slash::string2l(value.data(), value.size(), &ival) || ival < 0) {
+      ret = "-ERR Invalid argument \'" + value + "\' for CONFIG SET 'max-client-response-size'\r\n";
+      return;
+    }
+    g_pika_conf->SetMaxClientResponseSize(ival);
+    ret = "+OK\r\n";
   } else if (set_item == "write-binlog") {
     int role = g_pika_server->role();
     if (role == PIKA_ROLE_SLAVE) {
@@ -1609,6 +1787,17 @@ void ConfigCmd::ConfigSet(std::string& ret) {
       g_pika_conf->SetCompactInterval(value);
       ret = "+OK\r\n";
     }
+  } else if (set_item == "sync-window-size") {
+    if (!slash::string2l(value.data(), value.size(), &ival)) {
+      ret = "-ERR Invalid argument \'" + value + "\' for CONFIG SET 'sync-window-size'\r\n";
+      return;
+    }
+    if (ival <= 0 || ival > kBinlogReadWinMaxSize) {
+      ret = "-ERR Argument exceed range \'" + value + "\' for CONFIG SET 'sync-window-size'\r\n";
+      return;
+    }
+    g_pika_conf->SetSyncWindowSize(ival);
+    ret = "+OK\r\n";
   } else {
     ret = "-ERR Unsupported CONFIG parameter: " + set_item + "\r\n";
   }
@@ -1632,6 +1821,18 @@ void MonitorCmd::DoInitial() {
 }
 
 void MonitorCmd::Do(std::shared_ptr<Partition> partition) {
+  std::shared_ptr<pink::PinkConn> conn_repl = GetConn();
+  if (!conn_repl) {
+    res_.SetRes(CmdRes::kErrOther, kCmdNameMonitor);
+    LOG(WARNING) << name_  << " weak ptr is empty";
+    return;
+  }
+  std::shared_ptr<pink::PinkConn> conn =
+    std::dynamic_pointer_cast<PikaClientConn>(conn_repl)->server_thread()->MoveConnOut(conn_repl->fd());
+  assert(conn.get() == conn_repl.get());
+  g_pika_server->AddMonitorClient(std::dynamic_pointer_cast<PikaClientConn>(conn));
+  g_pika_server->AddMonitorMessage("OK");
+  return; // Monitor thread will return "OK"
 }
 
 void DbsizeCmd::DoInitial() {
@@ -1842,7 +2043,7 @@ void PaddingCmd::Do(std::shared_ptr<Partition> partition) {
 
 std::string PaddingCmd::ToBinlog(
         uint32_t exec_time,
-        const std::string& server_id,
+        uint32_t term_id,
         uint64_t logic_id,
         uint32_t filenum,
         uint64_t offset) {
@@ -1911,3 +2112,41 @@ void TcmallocCmd::Do(std::shared_ptr<Partition> partition) {
   }
 }
 #endif
+
+void PKPatternMatchDelCmd::DoInitial() {
+  if (!CheckArg(argv_.size())) {
+    res_.SetRes(CmdRes::kWrongNum, kCmdNamePKPatternMatchDel); 
+    return;
+  } 
+  pattern_ = argv_[1];
+  if (!strcasecmp(argv_[2].data(), "set")) {
+    type_ = blackwidow::kSets;
+  } else if (!strcasecmp(argv_[2].data(), "list")) {
+    type_ = blackwidow::kLists;
+  } else if (!strcasecmp(argv_[2].data(), "string")) {
+    type_ = blackwidow::kStrings;
+  } else if (!strcasecmp(argv_[2].data(), "zset")) {
+    type_ = blackwidow::kZSets;
+  } else if (!strcasecmp(argv_[2].data(), "hash")) {
+    type_ = blackwidow::kHashes;
+  } else {
+    res_.SetRes(CmdRes::kInvalidDbType, kCmdNamePKPatternMatchDel);
+    return;
+  }
+}
+
+void PKPatternMatchDelCmd::Do(std::shared_ptr<Partition> partition) {
+  int ret = 0;
+  rocksdb::Status s = partition->db()->PKPatternMatchDel(type_, pattern_, &ret);
+  if (s.ok()) {
+    res_.AppendInteger(ret);
+  } else {
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
+  }
+}
+
+void DummyCmd::DoInitial() {
+}
+
+void DummyCmd::Do(std::shared_ptr<Partition> partition) {
+}

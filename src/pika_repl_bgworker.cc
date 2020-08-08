@@ -44,6 +44,15 @@ void PikaReplBgWorker::QueueClear() {
   bg_thread_.QueueClear();
 }
 
+void PikaReplBgWorker::ParseBinlogOffset(
+    const InnerMessage::BinlogOffset pb_offset,
+    LogOffset* offset) {
+  offset->b_offset.filenum = pb_offset.filenum();
+  offset->b_offset.offset = pb_offset.offset();
+  offset->l_offset.term = pb_offset.term();
+  offset->l_offset.index = pb_offset.index();
+}
+
 void PikaReplBgWorker::HandleBGWorkerWriteBinlog(void* arg) {
   ReplClientWriteBinlogTaskArg* task_arg = static_cast<ReplClientWriteBinlogTaskArg*>(arg);
   const std::shared_ptr<InnerMessage::InnerResponse> res = task_arg->res;
@@ -54,7 +63,9 @@ void PikaReplBgWorker::HandleBGWorkerWriteBinlog(void* arg) {
 
   std::string table_name;
   uint32_t partition_id = 0;
-  BinlogOffset ack_start, ack_end;
+  LogOffset pb_begin, pb_end;
+  bool only_keepalive = false;
+
   // find the first not keepalive binlogsync
   for (size_t i = 0; i < index->size(); ++i) {
     const InnerMessage::InnerResponse::BinlogSync& binlog_res = res->binlog_sync((*index)[i]);
@@ -63,15 +74,39 @@ void PikaReplBgWorker::HandleBGWorkerWriteBinlog(void* arg) {
       partition_id = binlog_res.partition().partition_id();
     }
     if (!binlog_res.binlog().empty()) {
-      ack_start.filenum = binlog_res.binlog_offset().filenum();
-      ack_start.offset = binlog_res.binlog_offset().offset();
+      ParseBinlogOffset(binlog_res.binlog_offset(), &pb_begin);
       break;
     }
   }
+
+  // find the last not keepalive binlogsync
+  for (int i = index->size() - 1; i >= 0; i--) {
+    const InnerMessage::InnerResponse::BinlogSync& binlog_res = res->binlog_sync((*index)[i]);
+    if (!binlog_res.binlog().empty()) {
+      ParseBinlogOffset(binlog_res.binlog_offset(), &pb_end);
+      break;
+    }
+  }
+
+  if (pb_begin == LogOffset()) {
+    only_keepalive = true;
+  }
+
+  LogOffset ack_start;
+  if (only_keepalive) {
+    ack_start = LogOffset();
+  } else {
+    ack_start = pb_begin;
+  }
+
+  // table_name and partition_id in the vector are same in the bgworker,
+  // because DispatchBinlogRes() have been order them. 
   worker->table_name_ = table_name;
   worker->partition_id_ = partition_id;
 
-  std::shared_ptr<Partition> partition = g_pika_server->GetTablePartitionById(table_name, partition_id);
+  std::shared_ptr<SyncMasterPartition> partition =
+    g_pika_rm->GetSyncMasterPartitionByName(
+        PartitionInfo(table_name, partition_id));
   if (!partition) {
     LOG(WARNING) << "Partition " << table_name << "_" << partition_id << " Not Found";
     delete index;
@@ -89,6 +124,36 @@ void PikaReplBgWorker::HandleBGWorkerWriteBinlog(void* arg) {
     return;
   }
 
+  if (res->has_consensus_meta()) {
+    const InnerMessage::ConsensusMeta& meta = res->consensus_meta();
+    if (meta.term() > partition->ConsensusTerm()) {
+      LOG(INFO) << "Update " << table_name << "_" << partition_id << " term from "
+        << partition->ConsensusTerm() << " to " << meta.term();
+      partition->ConsensusUpdateTerm(meta.term());
+    } else if (meta.term() < partition->ConsensusTerm()) /*outdated pb*/{
+      LOG(WARNING) << "Drop outdated binlog sync response " << table_name << "_" << partition_id
+        << " recv term: " << meta.term()  << " local term: " << partition->ConsensusTerm();
+      delete index;
+      delete task_arg;
+      return;
+    }
+    if (!only_keepalive) {
+      LogOffset last_offset = partition->ConsensusLastIndex();
+      LogOffset prev_offset;
+      ParseBinlogOffset(res->consensus_meta().log_offset(), &prev_offset);
+      if (last_offset.l_offset.index != 0 &&
+          (last_offset.l_offset != prev_offset.l_offset
+          || last_offset.b_offset != prev_offset.b_offset)) {
+        LOG(WARNING) << "last_offset " << last_offset.ToString() <<
+          " NOT equal to pb prev_offset " << prev_offset.ToString();
+        slave_partition->SetReplState(ReplState::kTryConnect);
+        delete index;
+        delete task_arg;
+        return;
+      }
+    }
+  }
+
   for (size_t i = 0; i < index->size(); ++i) {
     const InnerMessage::InnerResponse::BinlogSync& binlog_res = res->binlog_sync((*index)[i]);
     // if pika are not current a slave or partition not in
@@ -101,13 +166,15 @@ void PikaReplBgWorker::HandleBGWorkerWriteBinlog(void* arg) {
       return;
     }
 
-    if (!g_pika_rm->CheckSlavePartitionSessionId(
-                binlog_res.partition().table_name(),
-                binlog_res.partition().partition_id(),
-                binlog_res.session_id())) {
+    if (slave_partition->MasterSessionId() != binlog_res.session_id()) {
+      LOG(WARNING)<< "Check SessionId Mismatch: " << slave_partition->MasterIp()
+        << ":" << slave_partition->MasterPort() << ", "
+        << slave_partition->SyncPartitionInfo().ToString()
+        << " expected_session: " << binlog_res.session_id() << ", actual_session:"
+        << slave_partition->MasterSessionId();
       LOG(WARNING) << "Check Session failed "
-          << binlog_res.partition().table_name()
-          << "_" << binlog_res.partition().partition_id();
+        << binlog_res.partition().table_name()
+        << "_" << binlog_res.partition().partition_id();
       slave_partition->SetReplState(ReplState::kTryConnect);
       delete index;
       delete task_arg;
@@ -141,21 +208,32 @@ void PikaReplBgWorker::HandleBGWorkerWriteBinlog(void* arg) {
   delete index;
   delete task_arg;
 
-  // Reply Ack to master immediately
-  std::shared_ptr<Binlog> logger = partition->logger();
-  logger->GetProducerStatus(&ack_end.filenum, &ack_end.offset);
-  // keepalive case
-  if (ack_start == BinlogOffset()) {
-    // set ack_end as 0
-    ack_end = ack_start;
+  if (res->has_consensus_meta()) {
+    LogOffset leader_commit;
+    ParseBinlogOffset(res->consensus_meta().commit(), &leader_commit);
+    // Update follower commit && apply
+    partition->ConsensusProcessLocalUpdate(leader_commit);
   }
+
+  LogOffset ack_end;
+  if (only_keepalive) {
+    ack_end = LogOffset();
+  } else {
+    LogOffset productor_status;
+    // Reply Ack to master immediately
+    std::shared_ptr<Binlog> logger = partition->Logger();
+    logger->GetProducerStatus(&productor_status.b_offset.filenum, &productor_status.b_offset.offset,
+      &productor_status.l_offset.term, &productor_status.l_offset.index);
+    ack_end = productor_status;
+    ack_end.l_offset.term = pb_end.l_offset.term;
+  }
+
   g_pika_rm->SendPartitionBinlogSyncAckRequest(table_name, partition_id, ack_start, ack_end);
 }
 
 int PikaReplBgWorker::HandleWriteBinlog(pink::RedisParser* parser, const pink::RedisCmdArgsType& argv) {
+  std::string opt = argv[0];
   PikaReplBgWorker* worker = static_cast<PikaReplBgWorker*>(parser->data);
-  const BinlogItem& binlog_item = worker->binlog_item_;
-  g_pika_server->UpdateQueryNumAndExecCountTable(argv[0]);
 
   // Monitor related
   std::string monitor_message;
@@ -170,8 +248,7 @@ int PikaReplBgWorker::HandleWriteBinlog(pink::RedisParser* parser, const pink::R
     g_pika_server->AddMonitorMessage(monitor_message);
   }
 
-  std::string opt = argv[0];
-  Cmd* c_ptr = g_pika_cmd_table_manager->GetCmd(slash::StringToLower(opt));
+  std::shared_ptr<Cmd> c_ptr = g_pika_cmd_table_manager->GetCmd(slash::StringToLower(opt));
   if (!c_ptr) {
     LOG(WARNING) << "Command " << opt << " not in the command table";
     return -1;
@@ -183,51 +260,25 @@ int PikaReplBgWorker::HandleWriteBinlog(pink::RedisParser* parser, const pink::R
     return -1;
   }
 
-  std::shared_ptr<Partition> partition = g_pika_server->GetTablePartitionById(worker->table_name_, worker->partition_id_);
-  std::shared_ptr<Binlog> logger = partition->logger();
+  g_pika_server->UpdateQueryNumAndExecCountTable(worker->table_name_, opt, c_ptr->is_write());
 
-  logger->Lock();
-  logger->Put(c_ptr->ToBinlog(binlog_item.exec_time(),
-                              std::to_string(binlog_item.server_id()),
-                              binlog_item.logic_id(),
-                              binlog_item.filenum(),
-                              binlog_item.offset()));
-  uint32_t filenum;
-  uint64_t offset;
-  logger->GetProducerStatus(&filenum, &offset);
-  logger->Unlock();
+  std::shared_ptr<SyncMasterPartition> partition
+    = g_pika_rm->GetSyncMasterPartitionByName(PartitionInfo(worker->table_name_, worker->partition_id_));
+  if (!partition) {
+    LOG(WARNING) << worker->table_name_ << worker->partition_id_ << "Not found.";
+  }
 
-  PikaCmdArgsType *v = new PikaCmdArgsType(argv);
-  BinlogItem *b = new BinlogItem(binlog_item);
-  std::string dispatch_key = argv.size() >= 2 ? argv[1] : argv[0];
-  g_pika_rm->ScheduleWriteDBTask(dispatch_key, v, b, worker->table_name_, worker->partition_id_);
+  partition->ConsensusProcessLeaderLog(c_ptr, worker->binlog_item_);
   return 0;
 }
 
 void PikaReplBgWorker::HandleBGWorkerWriteDB(void* arg) {
   ReplClientWriteDBTaskArg* task_arg = static_cast<ReplClientWriteDBTaskArg*>(arg);
-  PikaCmdArgsType* argv = task_arg->argv;
-  BinlogItem binlog_item = *(task_arg->binlog_item);
+  const std::shared_ptr<Cmd> c_ptr = task_arg->cmd_ptr;
+  const PikaCmdArgsType& argv = c_ptr->argv();
+  LogOffset offset = task_arg->offset;
   std::string table_name = task_arg->table_name;
   uint32_t partition_id = task_arg->partition_id;
-  std::string opt = (*argv)[0];
-  slash::StringToLower(opt);
-
-  // Get command
-  Cmd* c_ptr = g_pika_cmd_table_manager->GetCmd(slash::StringToLower(opt));
-  if (!c_ptr) {
-    LOG(WARNING) << "Error operation from binlog: " << opt;
-    delete task_arg;
-    return;
-  }
-
-  // Initial
-  c_ptr->Initial(*argv, table_name);
-  if (!c_ptr->res().ok()) {
-    LOG(WARNING) << "Fail to initial command from binlog: " << opt;
-    delete task_arg;
-    return;
-  }
 
   uint64_t start_us = 0;
   if (g_pika_conf->slowlog_slower_than() >= 0) {
@@ -249,12 +300,22 @@ void PikaReplBgWorker::HandleBGWorkerWriteDB(void* arg) {
     int32_t start_time = start_us / 1000000;
     int64_t duration = slash::NowMicros() - start_us;
     if (duration > g_pika_conf->slowlog_slower_than()) {
-      g_pika_server->SlowlogPushEntry(*argv, start_time, duration);
+      g_pika_server->SlowlogPushEntry(argv, start_time, duration);
       if (g_pika_conf->slowlog_write_errorlog()) {
-        LOG(ERROR) << "command: " << opt << ", start_time(s): " << start_time << ", duration(us): " << duration;
+        LOG(ERROR) << "command: " << argv[0] << ", start_time(s): " << start_time << ", duration(us): " << duration;
       }
     }
   }
-  delete task_arg;
-}
 
+  delete task_arg;
+
+  if (g_pika_conf->consensus_level() != 0) {
+    std::shared_ptr<SyncMasterPartition> partition =
+      g_pika_rm->GetSyncMasterPartitionByName(PartitionInfo(table_name, partition_id));
+    if (partition == nullptr) {
+      LOG(WARNING) << "Sync Master Partition not exist " << table_name << partition_id;
+      return;
+    }
+    partition->ConsensusUpdateAppliedIndex(offset);
+  }
+}

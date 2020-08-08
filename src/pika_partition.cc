@@ -55,18 +55,13 @@ std::string DbSyncPath(const std::string& sync_path,
 
 Partition::Partition(const std::string& table_name,
                      uint32_t partition_id,
-                     const std::string& table_db_path,
-                     const std::string& table_log_path) :
+                     const std::string& table_db_path) :
   table_name_(table_name),
   partition_id_(partition_id),
-  binlog_io_error_(false),
-  bgsave_engine_(NULL),
-  purging_(false) {
+  bgsave_engine_(NULL) {
 
   db_path_ = g_pika_conf->classic_mode() ?
       table_db_path : PartitionPath(table_db_path, partition_id_);
-  log_path_ = g_pika_conf->classic_mode() ?
-      table_log_path : PartitionPath(table_log_path, partition_id_);
   bgsave_sub_path_ = g_pika_conf->classic_mode() ?
       table_name : BgsaveSubPath(table_name_, partition_id_);
   dbsync_path_ = DbSyncPath(g_pika_conf->db_sync_path(), table_name_,
@@ -90,9 +85,6 @@ Partition::Partition(const std::string& table_name,
   assert(db_);
   assert(s.ok());
   LOG(INFO) << partition_name_ << " DB Success";
-
-  logger_ = std::shared_ptr<Binlog>(
-          new Binlog(log_path_, g_pika_conf->binlog_file_size()));
 }
 
 Partition::~Partition() {
@@ -113,7 +105,6 @@ void Partition::Close() {
   }
   slash::RWLock rwl(&db_rwlock_, true);
   db_.reset();
-  logger_.reset();
   opened_ = false;
 }
 
@@ -135,18 +126,7 @@ void Partition::MoveToTrash() {
   }
   g_pika_server->PurgeDir(dbpath);
 
-  std::string logpath = log_path_;
-  if (logpath[logpath.length() - 1] == '/') {
-    logpath.erase(logpath.length() - 1);
-  }
-  logpath.append("_deleting/");
-  if (slash::RenameFile(log_path_, logpath.c_str())) {
-    LOG(WARNING) << "Failed to move log to trash, error: " << strerror(errno);
-    return;
-  }
-  g_pika_server->PurgeDir(logpath);
-
-  LOG(WARNING) << "Partition: " << partition_name_ << " move to trash success";
+  LOG(WARNING) << "Partition DB: " << partition_name_ << " move to trash success";
 }
 
 std::string Partition::GetTableName() const {
@@ -161,65 +141,8 @@ std::string Partition::GetPartitionName() const {
   return partition_name_;
 }
 
-std::shared_ptr<Binlog> Partition::logger() const {
-  return logger_;
-}
-
 std::shared_ptr<blackwidow::BlackWidow> Partition::db() const {
   return db_;
-}
-
-void Partition::DoCommand(Cmd* const cmd) {
-  if (!opened_) {
-    LOG(WARNING) << partition_name_ << " not opened, failed to exec command";
-    cmd->res().SetRes(CmdRes::kErrOther, "Partition Not Opened");
-    return;
-  }
-  slash::lock::MultiRecordLock record_lock(lock_mgr_);
-  if (!cmd->is_suspend()) {
-    DbRWLockReader();
-  }
-  if (cmd->is_write()) {
-    record_lock.Lock(cmd->current_key());
-  }
-
-  uint32_t exec_time = time(nullptr);
-  cmd->Do(shared_from_this());
-
-  if (cmd->res().ok()
-    && cmd->is_write()
-    && g_pika_conf->write_binlog()) {
-
-    logger_->Lock();
-    uint32_t filenum = 0;
-    uint64_t offset = 0;
-    uint64_t logic_id = 0;
-    logger_->GetProducerStatus(&filenum, &offset, &logic_id);
-
-    std::string binlog = cmd->ToBinlog(exec_time,
-                                       g_pika_conf->server_id(),
-                                       logic_id,
-                                       filenum,
-                                       offset);
-    slash::Status s;
-    if (!binlog.empty()) {
-      s = logger_->Put(binlog);
-    }
-
-    logger_->Unlock();
-    if (!s.ok()) {
-      LOG(WARNING) << partition_name_ << " Writing binlog failed, maybe no space left on device";
-      SetBinlogIoError(true);
-      cmd->res().SetRes(CmdRes::kErrOther, "Writing binlog failed, maybe no space left on device");
-    }
-  }
-
-  if (cmd->is_write()) {
-    record_lock.Unlock(cmd->current_key());
-  }
-  if (!cmd->is_suspend()) {
-    DbRWUnLock();
-  }
 }
 
 void Partition::Compact(const blackwidow::DataType& type) {
@@ -239,28 +162,8 @@ void Partition::DbRWUnLock() {
   pthread_rwlock_unlock(&db_rwlock_);
 }
 
-void Partition::SetBinlogIoError(bool error) {
-  binlog_io_error_ = error;
-}
-
-bool Partition::IsBinlogIoError() {
-  return binlog_io_error_;
-}
-
-bool Partition::GetBinlogOffset(BinlogOffset* const boffset) {
-  if (opened_) {
-    logger_->GetProducerStatus(&boffset->filenum, &boffset->offset);
-    return true;
-  }
-  return false;
-}
-
-bool Partition::SetBinlogOffset(const BinlogOffset& boffset) {
-  if (opened_) {
-    logger_->SetProducerStatus(boffset.filenum, boffset.offset);
-    return true;
-  }
-  return false;
+slash::lock::LockMgr* Partition::LockMgr() {
+  return lock_mgr_;
 }
 
 void Partition::PrepareRsync() {
@@ -302,12 +205,12 @@ bool Partition::TryUpdateMasterOffset() {
   }
   std::string line, master_ip;
   int lineno = 0;
-  int64_t filenum = 0, offset = 0, tmp = 0, master_port = 0;
+  int64_t filenum = 0, offset = 0, term = 0, index = 0, tmp = 0, master_port = 0;
   while (std::getline(is, line)) {
     lineno++;
     if (lineno == 2) {
       master_ip = line;
-    } else if (lineno > 2 && lineno < 6) {
+    } else if (lineno > 2 && lineno < 8) {
       if (!slash::string2l(line.data(), line.size(), &tmp) || tmp < 0) {
         LOG(WARNING) << "Partition: " << partition_name_
             << ", Format of info file after db sync error, line : " << line;
@@ -317,9 +220,10 @@ bool Partition::TryUpdateMasterOffset() {
       }
       if (lineno == 3) { master_port = tmp; }
       else if (lineno == 4) { filenum = tmp; }
-      else { offset = tmp; }
-
-    } else if (lineno > 5) {
+      else if (lineno == 5) { offset = tmp; }
+      else if (lineno == 6) { term = tmp; }
+      else if (lineno == 7) { index = tmp; }
+    } else if (lineno > 8) {
       LOG(WARNING) << "Partition: " << partition_name_
           << ", Format of info file after db sync error, line : " << line;
       is.close();
@@ -333,7 +237,9 @@ bool Partition::TryUpdateMasterOffset() {
       << ",  master_ip: " << master_ip
       << ", master_port: " << master_port
       << ", filenum: " << filenum
-      << ", offset: " << offset;
+      << ", offset: " << offset
+      << ", term: " << term
+      << ", index: " << index;
 
   // Sanity check
   if (master_ip != slave_partition->MasterIp()
@@ -353,7 +259,18 @@ bool Partition::TryUpdateMasterOffset() {
   }
 
   // Update master offset
-  logger_->SetProducerStatus(filenum, offset);
+  std::shared_ptr<SyncMasterPartition> master_partition =
+    g_pika_rm->GetSyncMasterPartitionByName(PartitionInfo(table_name_, partition_id_));
+  if (!master_partition) {
+    LOG(WARNING) << "Master Partition: " << partition_name_ << " not exist";
+    return false;
+  }
+  if (g_pika_conf->consensus_level() != 0) {
+    master_partition->ConsensusReset(
+        LogOffset(BinlogOffset(filenum, offset), LogicOffset(term, index)));
+  } else {
+    master_partition->Logger()->SetProducerStatus(filenum, offset);
+  }
   slave_partition->SetReplState(ReplState::kTryConnect);
   return true;
 }
@@ -433,8 +350,12 @@ void Partition::DoBgSave(void* arg) {
     out << (time(NULL) - info.start_time) << "s\n"
       << g_pika_server->host() << "\n"
       << g_pika_server->port() << "\n"
-      << info.filenum << "\n"
-      << info.offset << "\n";
+      << info.offset.b_offset.filenum << "\n"
+      << info.offset.b_offset.offset << "\n";
+    if (g_pika_conf->consensus_level() != 0) {
+      out << info.offset.l_offset.term << "\n"
+          << info.offset.l_offset.index << "\n";
+    }
     out.close();
   }
   if (!success) {
@@ -456,8 +377,8 @@ bool Partition::RunBgsaveEngine() {
 
   BgSaveInfo info = bgsave_info();
   LOG(INFO) << partition_name_ << " bgsave_info: path=" << info.path
-    << ",  filenum=" << info.filenum
-    << ", offset=" << info.offset;
+    << ",  filenum=" << info.offset.b_offset.filenum
+    << ", offset=" << info.offset.b_offset.offset;
 
   // Backup to tmp dir
   rocksdb::Status s = bgsave_engine_->CreateNewBackup(info.path);
@@ -502,11 +423,24 @@ bool Partition::InitBgsaveEngine() {
     return false;
   }
 
+  std::shared_ptr<SyncMasterPartition> partition = g_pika_rm->GetSyncMasterPartitionByName(PartitionInfo(table_name_, partition_id_));
+  if (!partition) {
+    LOG(WARNING) << partition_name_ << " not found";
+    return false;
+  }
+
   {
     RWLock l(&db_rwlock_, true);
+    LogOffset bgsave_offset;
+    if (g_pika_conf->consensus_level() != 0) {
+      bgsave_offset = partition->ConsensusAppliedIndex();
+    } else {
+      // term, index are 0
+      partition->Logger()->GetProducerStatus(&(bgsave_offset.b_offset.filenum), &(bgsave_offset.b_offset.offset));
+    }
     {
       slash::MutexLock l(&bgsave_protector_);
-      logger_->GetProducerStatus(&bgsave_info_.filenum, &bgsave_info_.offset);
+      bgsave_info_.offset = bgsave_offset;
     }
     s = bgsave_engine_->SetBackupContent();
     if (!s.ok()) {
@@ -578,98 +512,6 @@ bool Partition::FlushSubDB(const std::string& db_name) {
   assert(s.ok());
   LOG(INFO) << partition_name_ << " open new " + db_name + " db success";
   g_pika_server->PurgeDir(del_dbpath);
-  return true;
-}
-
-bool Partition::PurgeLogs(uint32_t to, bool manual) {
-  // Only one thread can go through
-  bool expect = false;
-  if (!purging_.compare_exchange_strong(expect, true)) {
-    LOG(WARNING) << "purge process already exist";
-    return false;
-  }
-  PurgeArg *arg = new PurgeArg();
-  arg->to = to;
-  arg->manual = manual;
-  arg->partition = shared_from_this();
-  g_pika_server->PurgelogsTaskSchedule(&DoPurgeLogs, static_cast<void*>(arg));
-  return true;
-}
-
-void Partition::ClearPurge() {
-  purging_ = false;
-}
-
-void Partition::DoPurgeLogs(void* arg) {
-  PurgeArg* purge = static_cast<PurgeArg*>(arg);
-  purge->partition->PurgeFiles(purge->to, purge->manual);
-  purge->partition->ClearPurge();
-  delete (PurgeArg*)arg;
-}
-
-bool Partition::PurgeFiles(uint32_t to, bool manual) {
-  std::map<uint32_t, std::string> binlogs;
-  if (!GetBinlogFiles(binlogs)) {
-    LOG(WARNING) << partition_name_ << " Could not get binlog files!";
-    return false;
-  }
-
-  int delete_num = 0;
-  struct stat file_stat;
-  int remain_expire_num = binlogs.size() - g_pika_conf->expire_logs_nums();
-  std::map<uint32_t, std::string>::iterator it;
-  for (it = binlogs.begin(); it != binlogs.end(); ++it) {
-    if ((manual && it->first <= to)                                                            // Manual purgelogsto
-      || (remain_expire_num > 0)                                                               // Expire num trigger
-      || (binlogs.size() - delete_num > 10                                                     // At lease remain 10 files
-          && stat(((log_path_ + it->second)).c_str(), &file_stat) == 0
-          && file_stat.st_mtime < time(NULL) - g_pika_conf->expire_logs_days() * 24 * 3600)) { // Expire time trigger
-      // We check this every time to avoid lock when we do file deletion
-      if (!g_pika_rm->BinlogCloudPurgeFromSMP(table_name_, partition_id_, it->first)) {
-        LOG(WARNING) << partition_name_ << " Could not purge "<< (it->first) << ", since it is already be used";
-        return false;
-      }
-
-      // Do delete
-      slash::Status s = slash::DeleteFile(log_path_ + it->second);
-      if (s.ok()) {
-        ++delete_num;
-        --remain_expire_num;
-      } else {
-        LOG(WARNING) << partition_name_ << " Purge log file : " << (it->second) <<  " failed! error:" << s.ToString();
-      }
-    } else {
-      // Break when face the first one not satisfied
-      // Since the binlogs is order by the file index
-      break;
-    }
-  }
-  if (delete_num) {
-    LOG(INFO) << partition_name_ << " Success purge "<< delete_num;
-  }
-  return true;
-}
-
-bool Partition::GetBinlogFiles(std::map<uint32_t, std::string>& binlogs) {
-  std::vector<std::string> children;
-  int ret = slash::GetChildren(log_path_, children);
-  if (ret != 0) {
-    LOG(WARNING) << partition_name_ << " Get all files in log path failed! error:" << ret;
-    return false;
-  }
-
-  int64_t index = 0;
-  std::string sindex;
-  std::vector<std::string>::iterator it;
-  for (it = children.begin(); it != children.end(); ++it) {
-    if ((*it).compare(0, kBinlogPrefixLen, kBinlogPrefix) != 0) {
-      continue;
-    }
-    sindex = (*it).substr(kBinlogPrefixLen);
-    if (slash::string2l(sindex.c_str(), sindex.size(), &index) == 1) {
-      binlogs.insert(std::pair<uint32_t, std::string>(static_cast<uint32_t>(index), *it));
-    }
-  }
   return true;
 }
 

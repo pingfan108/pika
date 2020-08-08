@@ -48,19 +48,18 @@ struct ReplClientWriteBinlogTaskArg {
 };
 
 struct ReplClientWriteDBTaskArg {
-  PikaCmdArgsType* argv;
-  BinlogItem* binlog_item;
+  const std::shared_ptr<Cmd> cmd_ptr;
+  LogOffset offset;
   std::string table_name;
   uint32_t partition_id;
-  ReplClientWriteDBTaskArg(PikaCmdArgsType* _argv,
-                           BinlogItem* _binlog_item,
+  ReplClientWriteDBTaskArg(const std::shared_ptr<Cmd> _cmd_ptr,
+                           const LogOffset _offset,
                            const std::string _table_name,
                            uint32_t _partition_id)
-      : argv(_argv), binlog_item(_binlog_item),
+      : cmd_ptr(_cmd_ptr),
+        offset(_offset),
         table_name(_table_name), partition_id(_partition_id) {}
   ~ReplClientWriteDBTaskArg() {
-    delete argv;
-    delete binlog_item;
   }
 };
 
@@ -81,8 +80,7 @@ class PikaReplClient {
                                const std::shared_ptr<InnerMessage::InnerResponse> res,
                                std::shared_ptr<pink::PbConn> conn,
                                void* req_private_data);
-  void ScheduleWriteDBTask(const std::string& dispatch_key,
-                           PikaCmdArgsType* argv, BinlogItem* binlog_item,
+  void ScheduleWriteDBTask(const std::shared_ptr<Cmd> cmd_ptr, const LogOffset& offset,
                            const std::string& table_name, uint32_t partition_id);
 
   Status SendMetaSync();
@@ -102,8 +100,8 @@ class PikaReplClient {
                                  uint32_t port,
                                  const std::string& table_name,
                                  uint32_t partition_id,
-                                 const BinlogOffset& ack_start,
-                                 const BinlogOffset& ack_end,
+                                 const LogOffset& ack_start,
+                                 const LogOffset& ack_end,
                                  const std::string& local_ip,
                                  bool is_frist_send);
   Status SendRemoveSlaveNode(const std::string& ip,

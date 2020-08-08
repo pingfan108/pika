@@ -11,10 +11,15 @@
 
 #include "pink/include/redis_cli.h"
 
-#define PIKA_SYNC_BUFFER_SIZE           10
+#define PIKA_SYNC_BUFFER_SIZE           1000
 #define PIKA_MAX_WORKER_THREAD_NUM      24
 #define PIKA_REPL_SERVER_TP_SIZE        3
 #define PIKA_META_SYNC_MAX_WAIT_TIME    10
+#define PIKA_SCAN_STEP_LENGTH           1000
+#define PIKA_MAX_CONN_RBUF              (1 << 28) // 256MB
+#define PIKA_MAX_CONN_RBUF_LB           (1 << 26) // 64MB
+#define PIKA_MAX_CONN_RBUF_HB           (1 << 29) // 512MB
+#define PIKA_SERVER_ID_MAX              65535
 
 class PikaServer;
 
@@ -63,13 +68,15 @@ struct SlaveItem {
 };
 
 enum ReplState {
-  kNoConnect  = 0,
-  kTryConnect = 1,
-  kTryDBSync  = 2,
-  kWaitDBSync = 3,
-  kWaitReply  = 4,
-  kConnected  = 5,
-  kError      = 6
+  kNoConnect   = 0,
+  kTryConnect  = 1,
+  kTryDBSync   = 2,
+  kWaitDBSync  = 3,
+  kWaitReply   = 4,
+  kConnected   = 5,
+  kError       = 6,
+// set to kDBNoConnect if execute cmd 'dbslaveof db no one'
+  kDBNoConnect = 7
 };
 
 // debug only
@@ -80,12 +87,37 @@ const std::string ReplStateMsg[] = {
   "kWaitDBSync",
   "kWaitReply",
   "kConnected",
-  "kError"
+  "kError",
+  "kDBNoConnect"
 };
 
 enum SlotState {
   INFREE = 0,
   INBUSY = 1,
+};
+
+struct LogicOffset {
+  uint32_t term;
+  uint64_t index;
+  LogicOffset()
+    : term(0), index(0) {}
+  LogicOffset(uint32_t _term, uint64_t _index)
+    : term(_term), index(_index) {}
+  LogicOffset(const LogicOffset& other) {
+    term = other.term;
+    index = other.index;
+  }
+  bool operator==(const LogicOffset& other) const {
+    return term == other.term && index == other.index;
+  }
+  bool operator!=(const LogicOffset& other) const {
+    return term != other.term || index != other.index;
+  }
+
+
+  std::string ToString() const {
+    return "term: " + std::to_string(term) + " index: " + std::to_string(index);
+  }
 };
 
 struct BinlogOffset {
@@ -108,6 +140,73 @@ struct BinlogOffset {
     }
     return false;
   }
+  bool operator!=(const BinlogOffset& other) const {
+    if (filenum != other.filenum || offset != other.offset) {
+      return true;
+    }
+    return false;
+  }
+
+  bool operator>(const BinlogOffset& other) const {
+    if (filenum > other.filenum
+        || (filenum == other.filenum && offset > other.offset)) {
+      return true;
+    }
+    return false;
+  }
+  bool operator<(const BinlogOffset& other) const {
+    if (filenum < other.filenum
+        || (filenum == other.filenum && offset < other.offset)) {
+      return true;
+    }
+    return false;
+  }
+  bool operator<=(const BinlogOffset& other) const {
+    if (filenum < other.filenum
+        || (filenum == other.filenum && offset <= other.offset)) {
+      return true;
+    }
+    return false;
+  }
+  bool operator>=(const BinlogOffset& other) const {
+    if (filenum > other.filenum
+        || (filenum == other.filenum && offset >= other.offset)) {
+      return true;
+    }
+    return false;
+  }
+};
+
+struct LogOffset {
+  LogOffset(const LogOffset& _log_offset) {
+    b_offset = _log_offset.b_offset;
+    l_offset = _log_offset.l_offset;
+  }
+  LogOffset() : b_offset(), l_offset() {
+  }
+  LogOffset(BinlogOffset _b_offset, LogicOffset _l_offset)
+    : b_offset(_b_offset), l_offset(_l_offset) {
+  }
+  bool operator<(const LogOffset& other) const {
+    return b_offset < other.b_offset;
+  }
+  bool operator==(const LogOffset& other) const {
+    return b_offset == other.b_offset;
+  }
+  bool operator<=(const LogOffset& other) const {
+    return b_offset <= other.b_offset;
+  }
+  bool operator>=(const LogOffset& other) const {
+    return b_offset >= other.b_offset;
+  }
+  bool operator>(const LogOffset& other) const {
+    return b_offset > other.b_offset;
+  }
+  std::string ToString() const  {
+    return b_offset.ToString() + " " + l_offset.ToString();
+  }
+  BinlogOffset b_offset;
+  LogicOffset  l_offset;
 };
 
 //dbsync arg
@@ -154,9 +253,9 @@ const std::string BinlogSyncStateMsg[] = {
 };
 
 struct BinlogChip {
-  BinlogOffset offset_;
+  LogOffset offset_;
   std::string binlog_;
-  BinlogChip(BinlogOffset offset, std::string binlog) : offset_(offset), binlog_(binlog) {
+  BinlogChip(LogOffset offset, std::string binlog) : offset_(offset), binlog_(binlog) {
   }
   BinlogChip(const BinlogChip& binlog_chip) {
     offset_ = binlog_chip.offset_;
@@ -326,7 +425,9 @@ struct hash_rm_node {
 struct WriteTask {
   struct RmNode rm_node_;
   struct BinlogChip binlog_chip_;
-  WriteTask(RmNode rm_node, BinlogChip binlog_chip) : rm_node_(rm_node), binlog_chip_(binlog_chip) {
+  LogOffset prev_offset_;
+  WriteTask(RmNode rm_node, BinlogChip binlog_chip, LogOffset prev_offset) :
+    rm_node_(rm_node), binlog_chip_(binlog_chip), prev_offset_(prev_offset) {
   }
 };
 
@@ -397,6 +498,7 @@ const size_t kBinlogPrefixLen = 10;
 
 const std::string kPikaMeta = "meta";
 const std::string kManifest = "manifest";
+const std::string kContext  = "context";
 
 /*
  * define common character

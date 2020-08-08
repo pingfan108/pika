@@ -27,7 +27,7 @@ PikaConf::~PikaConf() {
 
 Status PikaConf::InternalGetTargetTable(const std::string& table_name, uint32_t* const target) {
   int32_t table_index = -1;
-  for (size_t idx = 0; table_structs_.size(); ++idx) {
+  for (size_t idx = 0; idx < table_structs_.size(); ++idx) {
     if (table_structs_[idx].table_name == table_name) {
       table_index = idx;
       break;
@@ -100,6 +100,48 @@ Status PikaConf::RemoveTablePartitions(const std::string& table_name,
   return s;
 }
 
+Status PikaConf::AddTable(const std::string &table_name, const uint32_t slot_num) {
+  Status s = AddTableSanityCheck(table_name);
+  if (!s.ok()) {
+    return  s;
+  }
+  RWLock l(&rwlock_, true);
+  table_structs_.push_back({table_name,slot_num,{}});
+  s = local_meta_->StableSave(table_structs_);
+  return s;
+}
+
+Status PikaConf::DelTable(const std::string &table_name) {
+  Status s = DelTableSanityCheck(table_name);
+  if (!s.ok()) {
+    return  s;
+  }
+  RWLock l(&rwlock_, true);
+  for (auto iter = table_structs_.begin();iter != table_structs_.end();iter++) {
+    if (iter->table_name == table_name) {
+      table_structs_.erase(iter);
+      break;
+    }
+  }
+  return local_meta_->StableSave(table_structs_);
+}
+
+Status PikaConf::AddTableSanityCheck(const std::string &table_name) {
+  RWLock l(&rwlock_, false);
+  uint32_t table_index = 0;
+  Status s = InternalGetTargetTable(table_name, &table_index);
+  if (!s.IsNotFound()) {
+    return Status::Corruption("table: " + table_name + " already exist");
+  }
+  return Status::OK();
+}
+
+Status PikaConf::DelTableSanityCheck(const std::string &table_name) {
+  RWLock l(&rwlock_, false);
+  uint32_t table_index = 0;
+  return InternalGetTargetTable(table_name, &table_index);
+}
+
 int PikaConf::Load()
 {
   int ret = LoadConf();
@@ -114,6 +156,8 @@ int PikaConf::Load()
   GetConfStr("server-id", &server_id_);
   if (server_id_.empty()) {
     server_id_ = "1";
+  } else if (PIKA_SERVER_ID_MAX < std::stoull(server_id_)) {
+    server_id_ = "PIKA_SERVER_ID_MAX";
   }
   GetConfStr("requirepass", &requirepass_);
   GetConfStr("masterauth", &masterauth_);
@@ -129,9 +173,12 @@ int PikaConf::Load()
 
   std::string swe;
   GetConfStr("slowlog-write-errorlog", &swe);
-  slowlog_write_errorlog_ = swe == "yes" ? true : false;
+  slowlog_write_errorlog_.store(swe == "yes" ? true : false);
 
-  GetConfInt("slowlog-log-slower-than", &slowlog_log_slower_than_);
+  int tmp_slowlog_log_slower_than;
+  GetConfInt("slowlog-log-slower-than", &tmp_slowlog_log_slower_than);
+  slowlog_log_slower_than_.store(tmp_slowlog_log_slower_than);
+
   GetConfInt("slowlog-max-len", &slowlog_max_len_);
   if (slowlog_max_len_ == 0) {
     slowlog_max_len_ = 128;
@@ -194,8 +241,8 @@ int PikaConf::Load()
   if (thread_pool_size_ <= 0) {
     thread_pool_size_ = 12;
   }
-  if (thread_pool_size_ > 24) {
-    thread_pool_size_ = 24;
+  if (thread_pool_size_ > 100) {
+    thread_pool_size_ = 100;
   }
   GetConfInt("sync-thread-num", &sync_thread_num_);
   if (sync_thread_num_ <= 0) {
@@ -207,10 +254,10 @@ int PikaConf::Load()
 
   std::string instance_mode;
   GetConfStr("instance-mode", &instance_mode);
-  classic_mode_ = (instance_mode.empty()
+  classic_mode_.store(instance_mode.empty()
           || !strcasecmp(instance_mode.data(), "classic"));
 
-  if (classic_mode_) {
+  if (classic_mode_.load()) {
     GetConfInt("databases", &databases_);
     if (databases_ < 1 || databases_ > 8) {
       LOG(FATAL) << "config databases error, limit [1 ~ 8], the actual is: "
@@ -236,6 +283,30 @@ int PikaConf::Load()
     }
   }
   default_table_ = table_structs_[0].table_name;
+
+  int tmp_replication_num = 0;
+  GetConfInt("replication-num", &tmp_replication_num);
+  if (tmp_replication_num > 4 || tmp_replication_num < 0) {
+    LOG(FATAL) << "replication-num " << tmp_replication_num <<
+      "is invalid, please pick from [0...4]";
+  }
+  replication_num_.store(tmp_replication_num);
+
+  int tmp_consensus_level = 0;
+  GetConfInt("consensus-level", &tmp_consensus_level);
+  if (tmp_consensus_level < 0 ||
+      tmp_consensus_level > replication_num_.load()) {
+    LOG(FATAL) << "consensus-level " << tmp_consensus_level
+      << " is invalid, current replication-num: " << replication_num_.load()
+      << ", please pick from 0 to replication-num"
+      << " [0..." << replication_num_.load() << "]";
+  }
+  consensus_level_.store(tmp_consensus_level);
+  if (classic_mode_.load() &&
+      (consensus_level_.load() != 0 || replication_num_.load() != 0)) {
+    LOG(FATAL) << "consensus-level & replication-num only configurable under sharding mode,"
+      << " set it to be 0 if you are using classic mode";
+  }
 
   compact_cron_ = "";
   GetConfStr("compact-cron", &compact_cron_);
@@ -296,6 +367,12 @@ int PikaConf::Load()
   GetConfInt64("max-write-buffer-size", &max_write_buffer_size_);
   if (max_write_buffer_size_ <= 0) {
     max_write_buffer_size_ = 10737418240;  // 10Gb
+  }
+
+  // max_client_response_size
+  GetConfInt64("max-client-response-size", &max_client_response_size_);
+  if (max_client_response_size_ <= 0) {
+    max_client_response_size_ = 1073741824; // 1Gb
   }
 
   // target_file_size_base
@@ -407,6 +484,28 @@ int PikaConf::Load()
   // slaveof
   slaveof_ = "";
   GetConfStr("slaveof", &slaveof_);
+
+  // sync window size
+  int tmp_sync_window_size = kBinlogReadWinDefaultSize;
+  GetConfInt("sync-window-size", &tmp_sync_window_size);
+  if (tmp_sync_window_size <= 0) {
+    sync_window_size_.store(kBinlogReadWinDefaultSize);
+  } else if (tmp_sync_window_size > kBinlogReadWinMaxSize) {
+    sync_window_size_.store(kBinlogReadWinMaxSize);
+  } else {
+    sync_window_size_.store(tmp_sync_window_size);
+  }
+
+  // max conn rbuf size
+  int tmp_max_conn_rbuf_size = PIKA_MAX_CONN_RBUF;
+  GetConfInt("max-conn-rbuf-size", &tmp_max_conn_rbuf_size);
+  if (tmp_max_conn_rbuf_size == PIKA_MAX_CONN_RBUF_LB
+      || tmp_max_conn_rbuf_size == PIKA_MAX_CONN_RBUF_HB) {
+    max_conn_rbuf_size_.store(tmp_max_conn_rbuf_size);
+  } else {
+    max_conn_rbuf_size_.store(PIKA_MAX_CONN_RBUF);
+  }
+
   return ret;
 }
 
@@ -432,16 +531,20 @@ int PikaConf::ConfigRewrite() {
   SetConfInt("expire-logs-days", expire_logs_days_);
   SetConfInt("expire-logs-nums", expire_logs_nums_);
   SetConfInt("root-connection-num", root_connection_num_);
-  SetConfStr("slowlog-write-errorlog", slowlog_write_errorlog_ ? "yes" : "no");
-  SetConfInt("slowlog-log-slower-than", slowlog_log_slower_than_);
+  SetConfStr("slowlog-write-errorlog", slowlog_write_errorlog_.load() ? "yes" : "no");
+  SetConfInt("slowlog-log-slower-than", slowlog_log_slower_than_.load());
   SetConfInt("slowlog-max-len", slowlog_max_len_);
   SetConfStr("write-binlog", write_binlog_ ? "yes" : "no");
   SetConfInt("max-cache-statistic-keys", max_cache_statistic_keys_);
   SetConfInt("small-compaction-threshold", small_compaction_threshold_);
+  SetConfInt("max-client-response-size", max_client_response_size_);
   SetConfInt("db-sync-speed", db_sync_speed_);
   SetConfStr("compact-cron", compact_cron_);
   SetConfStr("compact-interval", compact_interval_);
   SetConfInt("slave-priority", slave_priority_);
+  SetConfInt("sync-window-size", sync_window_size_.load());
+  SetConfInt("consensus-level", consensus_level_.load());
+  SetConfInt("replication-num", replication_num_.load());
   // slaveof config item is special
   SetConfStr("slaveof", slaveof_);
 

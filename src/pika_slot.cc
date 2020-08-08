@@ -145,8 +145,15 @@ void SlotsMgrtTagSlotAsyncCmd::DoInitial() {
   std::string str_max_bytes_ = *it++;
 
   std::string str_slot_num = *it++;
+
+  std::shared_ptr<Table> table = g_pika_server->GetTable(table_name_);
+  if (table == NULL) {
+    res_.SetRes(CmdRes::kNotFound, kCmdNameSlotsMgrtTagSlotAsync);
+    return;
+  }
+
   if (!slash::string2l(str_slot_num.data(), str_slot_num.size(), &slot_num_)
-      || slot_num_ < 0 || slot_num_ >= g_pika_conf->default_slot_num()) {
+      || slot_num_ < 0 || slot_num_ >= table->PartitionNum()) {
     res_.SetRes(CmdRes::kInvalidInt, kCmdNameSlotsMgrtTagSlotAsync);
     return;
   }
@@ -164,8 +171,16 @@ void SlotsMgrtTagSlotAsyncCmd::Do(std::shared_ptr<Partition> partition) {
   // Until sync done, new node slaveof no one.
   // mark this migrate done
   // proxy retry cached request in new node
-  bool is_exist = g_pika_rm->CheckPartitionSlaveExist(
-      RmNode(dest_ip_, dest_port_, g_pika_conf->default_table(), slot_num_));
+  bool is_exist = true;
+  std::shared_ptr<SyncMasterPartition> master_partition =
+      g_pika_rm->GetSyncMasterPartitionByName(PartitionInfo(table_name_, slot_num_));
+  if (!master_partition) {
+    LOG(WARNING) << "Sync Master Partition: " << table_name_ << ":" << slot_num_
+        << ", NotFound";
+    res_.SetRes(CmdRes::kNotFound, kCmdNameSlotsMgrtTagSlotAsync);
+    return;
+  }
+  is_exist = master_partition->CheckSlaveNodeExist(dest_ip_, dest_port_);
   if (is_exist) {
     remained = 1;
   } else {
@@ -236,7 +251,8 @@ void SlotsScanCmd::Do(std::shared_ptr<Partition> partition) {
     return;
   }
   std::vector<std::string> keys;
-  int64_t cursor_ret = cur_partition->db()->Scan(cursor_, pattern_, count_, &keys);
+  int64_t cursor_ret = cur_partition->db()->Scan(blackwidow::DataType::kAll,
+          cursor_, pattern_, count_, &keys);
 
   res_.AppendArrayLen(2);
 

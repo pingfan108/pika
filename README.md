@@ -1,6 +1,6 @@
-# Pika
+<img src="https://s1.ax1x.com/2020/05/08/YnbjQf.png" alt="YnbjQf.png"  width="300" />
 
-[![Build Status](https://travis-ci.org/Qihoo360/pika.svg?branch=master)](https://travis-ci.org/Qihoo360/pika)
+[![Build Status](https://travis-ci.org/Qihoo360/pika.svg?branch=master)](https://travis-ci.org/Qihoo360/pika) ![Downloads](https://img.shields.io/github/downloads/Qihoo360/pika/total)
 
 ## Introduction[中文](https://github.com/Qihoo360/pika/blob/master/README_CN.md)
 
@@ -105,7 +105,9 @@ More details on [Performance](https://github.com/Qihoo360/pika/wiki/3.2.x-Perfor
 
 ## Contact Us
 
-Mail: g-infra@360.cn
+Users Mail Group: [join in pika_users@groups.163.com](http://163.fm/7VSsSWUJ)
+
+Developers Mail Group: [join in pika_developers@groups.163.com](http://163.fm/Q70Qbg3v)
 
 QQ group: 294254078
 

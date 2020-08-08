@@ -14,8 +14,9 @@ extern PikaConf* g_pika_conf;
 extern PikaServer* g_pika_server;
 
 PikaDispatchThread::PikaDispatchThread(std::set<std::string> &ips, int port, int work_num,
-                                       int cron_interval, int queue_limit)
-      : handles_(this) {
+                                       int cron_interval, int queue_limit, int max_conn_rbuf_size)
+    : conn_factory_(max_conn_rbuf_size),
+      handles_(this) {
   thread_rep_ = pink::NewDispatchThread(ips, port, work_num, &conn_factory_,
                                         cron_interval, queue_limit, &handles_);
   thread_rep_->set_thread_name("Dispatcher");
@@ -74,5 +75,4 @@ bool PikaDispatchThread::Handles::AccessHandle(std::string& ip) const {
 
 void PikaDispatchThread::Handles::CronHandle() const {
   pika_disptcher_->thread_rep_->set_keepalive_timeout(g_pika_conf->timeout());
-  g_pika_server->ResetLastSecQuerynum();
 }

@@ -9,9 +9,13 @@
 #include <unordered_map>
 
 #include "pink/include/redis_conn.h"
+#include "pink/include/pink_conn.h"
 #include "slash/include/slash_string.h"
 
 #include "include/pika_partition.h"
+
+class SyncMasterPartition;
+class SyncSlavePartition;
 
 //Constant for command name
 //Admin
@@ -40,6 +44,8 @@ const std::string kCmdNamePadding = "padding";
 #ifdef TCMALLOC_EXTENSION
 const std::string kCmdNameTcmalloc = "tcmalloc";
 #endif
+const std::string kCmdNamePKPatternMatchDel = "pkpatternmatchdel";
+const std::string kCmdDummy = "dummy";
 
 //Kv
 const std::string kCmdNameSet = "set";
@@ -205,6 +211,8 @@ const std::string kCmdNamePkClusterInfo = "pkclusterinfo";
 const std::string kCmdNamePkClusterAddSlots = "pkclusteraddslots";
 const std::string kCmdNamePkClusterDelSlots = "pkclusterdelslots";
 const std::string kCmdNamePkClusterSlotsSlaveof = "pkclusterslotsslaveof";
+const std::string kCmdNamePkClusterAddTable = "pkclusteraddtable";
+const std::string kCmdNamePkClusterDelTable = "pkclusterdeltable";
 
 const std::string kClusterPrefix = "pkcluster";
 typedef pink::RedisCmdArgsType PikaCmdArgsType;
@@ -276,7 +284,7 @@ public:
     kInvalidIndex,
     kInvalidDbType,
     kInvalidTable,
-    kErrOther,
+    kErrOther
   };
 
   CmdRes():ret_(kNone) {}
@@ -338,7 +346,9 @@ public:
       result.append("' command\r\n");
       break;
     case kInvalidIndex:
-      result = "-ERR invalid DB index\r\n";
+      result = "-ERR invalid DB index for '";
+      result.append(message_);
+      result.append("'\r\n");
       break;
     case kInvalidDbType:
       result = "-ERR invalid DB for '";
@@ -371,14 +381,14 @@ public:
   void AppendInteger(int64_t ori) {
     RedisAppendLen(message_, ori, ":");
   }
-  void AppendContent(const std::string &value) {
+  void AppendContent(const std::string& value) {
     RedisAppendContent(message_, value);
   }
-  void AppendString(const std::string &value) {
+  void AppendString(const std::string& value) {
     AppendStringLen(value.size());
     AppendContent(value);
   }
-  void AppendStringRaw(std::string &value) {
+  void AppendStringRaw(const std::string& value) {
     message_.append(value);
   }
   void SetRes(CmdRet _ret, const std::string content = "") {
@@ -393,10 +403,37 @@ private:
   CmdRet ret_;
 };
 
-class Cmd {
+class Cmd: public std::enable_shared_from_this<Cmd> {
  public:
+  enum CmdStage {
+    kNone,
+    kBinlogStage,
+    kExecuteStage
+  };
+  struct HintKeys {
+    HintKeys() {}
+    void Push(const std::string& key, int hint) {
+      keys.push_back(key);
+      hints.push_back(hint);
+    }
+    bool empty() const {
+      return keys.empty() && hints.empty();
+    }
+    std::vector<std::string> keys;
+    std::vector<int> hints;
+  };
+  struct ProcessArg {
+    ProcessArg() {}
+    ProcessArg(std::shared_ptr<Partition> _partition,
+        std::shared_ptr<SyncMasterPartition> _sync_partition,
+        HintKeys _hint_keys) : partition(_partition),
+        sync_partition(_sync_partition), hint_keys(_hint_keys) {}
+    std::shared_ptr<Partition> partition;
+    std::shared_ptr<SyncMasterPartition> sync_partition;
+    HintKeys hint_keys;
+  };
   Cmd(const std::string& name, int arity, uint16_t flag)
-    : name_(name), arity_(arity), flag_(flag) {}
+    : name_(name), arity_(arity), flag_(flag), stage_(kNone) {}
   virtual ~Cmd() {}
 
   virtual std::vector<std::string> current_key() const;
@@ -407,6 +444,10 @@ class Cmd {
   virtual void ProcessMultiPartitionCmd();
   virtual void ProcessDoNotSpecifyPartitionCmd();
   virtual void Do(std::shared_ptr<Partition> partition = nullptr) = 0;
+  virtual Cmd* Clone() = 0;
+  // used for execute multikey command into different slots
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) = 0;
+  virtual void Merge() = 0;
 
   void Initial(const PikaCmdArgsType& argv,
                const std::string& table_name);
@@ -420,14 +461,31 @@ class Cmd {
 
   std::string name() const;
   CmdRes& res();
-
+  std::string table_name() const;
+  BinlogOffset binlog_offset() const;
+  const PikaCmdArgsType& argv() const;
   virtual std::string ToBinlog(uint32_t exec_time,
-                               const std::string& server_id,
+                               uint32_t term_id,
                                uint64_t logic_id,
                                uint32_t filenum,
                                uint64_t offset);
 
+  void SetConn(const std::shared_ptr<pink::PinkConn> conn);
+  std::shared_ptr<pink::PinkConn> GetConn();
+
+  void SetResp(const std::shared_ptr<std::string> resp);
+  std::shared_ptr<std::string> GetResp();
+
+  void SetStage(CmdStage stage);
  protected:
+  // enable copy, used default copy
+  //Cmd(const Cmd&);
+  void ProcessCommand(std::shared_ptr<Partition> partition,
+      std::shared_ptr<SyncMasterPartition> sync_partition, const HintKeys& hint_key = HintKeys());
+  void InternalProcessCommand(std::shared_ptr<Partition> partition,
+      std::shared_ptr<SyncMasterPartition> sync_partition, const HintKeys& hint_key);
+  void DoCommand(std::shared_ptr<Partition> partition, const HintKeys& hint_key);
+  void DoBinlog(std::shared_ptr<SyncMasterPartition> partition);
   bool CheckArg(int num) const;
   void LogCommand() const;
 
@@ -439,11 +497,14 @@ class Cmd {
   PikaCmdArgsType argv_;
   std::string table_name_;
 
+  std::weak_ptr<pink::PinkConn> conn_;
+  std::weak_ptr<std::string> resp_;
+  CmdStage stage_;
+
  private:
   virtual void DoInitial() = 0;
   virtual void Clear() {};
 
-  Cmd(const Cmd&);
   Cmd& operator=(const Cmd&);
 };
 

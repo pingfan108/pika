@@ -24,6 +24,11 @@ class HDelCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new HDelCmd(*this);
+  }
  private:
   std::string key_;
   std::vector<std::string> fields_;
@@ -40,6 +45,11 @@ class HGetCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new HGetCmd(*this);
+  }
  private:
   std::string key_, field_;
   virtual void DoInitial() override;
@@ -55,6 +65,11 @@ class HGetallCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new HGetallCmd(*this);
+  }
  private:
   std::string key_;
   virtual void DoInitial() override;
@@ -70,6 +85,11 @@ class HSetCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new HSetCmd(*this);
+  }
  private:
   std::string key_, field_, value_;
   virtual void DoInitial() override;
@@ -85,6 +105,11 @@ class HExistsCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new HExistsCmd(*this);
+  }
  private:
   std::string key_, field_;
   virtual void DoInitial() override;
@@ -100,6 +125,11 @@ class HIncrbyCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new HIncrbyCmd(*this);
+  }
  private:
   std::string key_, field_;
   int64_t by_;
@@ -116,6 +146,11 @@ class HIncrbyfloatCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new HIncrbyfloatCmd(*this);
+  }
  private:
   std::string key_, field_, by_;
   virtual void DoInitial() override;
@@ -131,6 +166,11 @@ class HKeysCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new HKeysCmd(*this);
+  }
  private:
   std::string key_;
   virtual void DoInitial() override;
@@ -146,6 +186,11 @@ class HLenCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new HLenCmd(*this);
+  }
  private:
   std::string key_;
   virtual void DoInitial() override;
@@ -161,6 +206,11 @@ class HMgetCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new HMgetCmd(*this);
+  }
  private:
   std::string key_;
   std::vector<std::string> fields_;
@@ -177,6 +227,11 @@ class HMsetCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new HMsetCmd(*this);
+  }
  private:
   std::string key_;
   std::vector<blackwidow::FieldValue> fvs_;
@@ -193,6 +248,11 @@ class HSetnxCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new HSetnxCmd(*this);
+  }
  private:
   std::string key_, field_, value_;
   virtual void DoInitial() override;
@@ -208,6 +268,11 @@ class HStrlenCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new HStrlenCmd(*this);
+  }
  private:
   std::string key_, field_;
   virtual void DoInitial() override;
@@ -223,6 +288,11 @@ class HValsCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new HValsCmd(*this);
+  }
  private:
   std::string key_, field_;
   virtual void DoInitial() override;
@@ -238,6 +308,11 @@ class HScanCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new HScanCmd(*this);
+  }
  private:
   std::string key_, pattern_;
   int64_t cursor_, count_;
@@ -258,6 +333,11 @@ class HScanxCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new HScanxCmd(*this);
+  }
  private:
   std::string key_, start_field_, pattern_;
   int64_t count_;
@@ -278,6 +358,11 @@ class PKHScanRangeCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new PKHScanRangeCmd(*this);
+  }
  private:
   std::string key_;
   std::string field_start_;
@@ -301,6 +386,11 @@ class PKHRScanRangeCmd : public Cmd {
     return res;
   }
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new PKHRScanRangeCmd(*this);
+  }
  private:
   std::string key_;
   std::string field_start_;

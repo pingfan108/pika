@@ -47,7 +47,7 @@ int PikaReplClient::Start() {
     res = bg_workers_[i]->StartThread();
     if (res != pink::kSuccess) {
       LOG(FATAL) << "Start Pika Repl Worker Thread Error: " << res
-          << (res == pink::kCreateThreadError ? ": create thread error " : ": other error");
+        << (res == pink::kCreateThreadError ? ": create thread error " : ": other error");
     }
   }
   return res;
@@ -75,12 +75,13 @@ void PikaReplClient::ScheduleWriteBinlogTask(std::string table_partition,
   bg_workers_[index]->Schedule(&PikaReplBgWorker::HandleBGWorkerWriteBinlog, static_cast<void*>(task_arg));
 }
 
-void PikaReplClient::ScheduleWriteDBTask(const std::string& dispatch_key,
-    PikaCmdArgsType* argv, BinlogItem* binlog_item,
-    const std::string& table_name, uint32_t partition_id) {
+void PikaReplClient::ScheduleWriteDBTask(const std::shared_ptr<Cmd> cmd_ptr,
+    const LogOffset& offset, const std::string& table_name, uint32_t partition_id) {
+  const PikaCmdArgsType& argv = cmd_ptr->argv();
+  std::string dispatch_key = argv.size() >= 2 ? argv[1] : argv[0];
   size_t index = GetHashIndex(dispatch_key, false);
   ReplClientWriteDBTaskArg* task_arg =
-    new ReplClientWriteDBTaskArg(argv, binlog_item, table_name, partition_id);
+    new ReplClientWriteDBTaskArg(cmd_ptr, offset, table_name, partition_id);
   bg_workers_[index]->Schedule(&PikaReplBgWorker::HandleBGWorkerWriteDB, static_cast<void*>(task_arg));
 }
 
@@ -197,6 +198,26 @@ Status PikaReplClient::SendPartitionTrySync(const std::string& ip,
   binlog_offset->set_filenum(boffset.filenum);
   binlog_offset->set_offset(boffset.offset);
 
+  if (g_pika_conf->consensus_level() != 0) {
+    std::shared_ptr<SyncMasterPartition> partition =
+      g_pika_rm->GetSyncMasterPartitionByName(PartitionInfo(table_name, partition_id));
+    if (!partition) {
+      return Status::Corruption("partition not found");
+    }
+    LogOffset last_index = partition->ConsensusLastIndex();
+    uint32_t term = partition->ConsensusTerm();
+    LOG(INFO) << PartitionInfo(table_name, partition_id).ToString() << " TrySync Increase self term from " << term << " to " << term + 1;
+    term++;
+    partition->ConsensusUpdateTerm(term);
+    InnerMessage::ConsensusMeta* consensus_meta = request.mutable_consensus_meta();
+    consensus_meta->set_term(term);
+    InnerMessage::BinlogOffset* pb_offset = consensus_meta->mutable_log_offset();
+    pb_offset->set_filenum(last_index.b_offset.filenum);
+    pb_offset->set_offset(last_index.b_offset.offset);
+    pb_offset->set_term(last_index.l_offset.term);
+    pb_offset->set_index(last_index.l_offset.index);
+  }
+
   std::string to_send;
   if (!request.SerializeToString(&to_send)) {
     LOG(WARNING) << "Serialize Partition TrySync Request Failed, to Master ("
@@ -210,8 +231,8 @@ Status PikaReplClient::SendPartitionBinlogSync(const std::string& ip,
                                                uint32_t port,
                                                const std::string& table_name,
                                                uint32_t partition_id,
-                                               const BinlogOffset& ack_start,
-                                               const BinlogOffset& ack_end,
+                                               const LogOffset& ack_start,
+                                               const LogOffset& ack_end,
                                                const std::string& local_ip,
                                                bool is_first_send) {
   InnerMessage::InnerRequest request;
@@ -225,14 +246,25 @@ Status PikaReplClient::SendPartitionBinlogSync(const std::string& ip,
   binlog_sync->set_first_send(is_first_send);
 
   InnerMessage::BinlogOffset* ack_range_start = binlog_sync->mutable_ack_range_start();
-  ack_range_start->set_filenum(ack_start.filenum);
-  ack_range_start->set_offset(ack_start.offset);
+  ack_range_start->set_filenum(ack_start.b_offset.filenum);
+  ack_range_start->set_offset(ack_start.b_offset.offset);
+  ack_range_start->set_term(ack_start.l_offset.term);
+  ack_range_start->set_index(ack_start.l_offset.index);
 
   InnerMessage::BinlogOffset* ack_range_end = binlog_sync->mutable_ack_range_end();
-  ack_range_end->set_filenum(ack_end.filenum);
-  ack_range_end->set_offset(ack_end.offset);
+  ack_range_end->set_filenum(ack_end.b_offset.filenum);
+  ack_range_end->set_offset(ack_end.b_offset.offset);
+  ack_range_end->set_term(ack_end.l_offset.term);
+  ack_range_end->set_index(ack_end.l_offset.index);
 
-  int32_t session_id = g_pika_rm->GetSlavePartitionSessionId(table_name, partition_id);
+  std::shared_ptr<SyncSlavePartition> slave_partition =
+    g_pika_rm->GetSyncSlavePartitionByName(
+        PartitionInfo(table_name, partition_id));
+  if (!slave_partition) {
+    LOG(WARNING) << "Slave Partition: " << table_name << "_" << partition_id << " not exist";
+    return Status::NotFound("SyncSlavePartition NotFound");
+  }
+  int32_t session_id = slave_partition->MasterSessionId();
   binlog_sync->set_session_id(session_id);
 
   std::string to_send;

@@ -23,6 +23,11 @@ class SlaveofCmd : public Cmd {
   SlaveofCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag), is_noone_(false) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new SlaveofCmd(*this);
+  }
 
  private:
   std::string master_ip_;
@@ -41,6 +46,11 @@ class DbSlaveofCmd : public Cmd {
   DbSlaveofCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new DbSlaveofCmd(*this);
+  }
 
  private:
   std::string db_name_;
@@ -63,6 +73,11 @@ class AuthCmd : public Cmd {
   AuthCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new AuthCmd(*this);
+  }
 
  private:
   std::string pwd_;
@@ -74,6 +89,11 @@ class BgsaveCmd : public Cmd {
   BgsaveCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new BgsaveCmd(*this);
+  }
 
  private:
   virtual void DoInitial() override;
@@ -88,6 +108,11 @@ class CompactCmd : public Cmd {
   CompactCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new CompactCmd(*this);
+  }
 
  private:
   virtual void DoInitial() override;
@@ -104,6 +129,11 @@ class PurgelogstoCmd : public Cmd {
   PurgelogstoCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag), num_(0) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new PurgelogstoCmd(*this);
+  }
 
  private:
   uint32_t num_;
@@ -116,6 +146,11 @@ class PingCmd : public Cmd {
   PingCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new PingCmd(*this);
+  }
 
  private:
   virtual void DoInitial() override;
@@ -126,9 +161,18 @@ class SelectCmd : public Cmd {
   SelectCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new SelectCmd(*this);
+  }
 
  private:
   virtual void DoInitial() override;
+  virtual void Clear() {
+    table_name_.clear();
+  }
+  std::string table_name_;
 };
 
 class FlushallCmd : public Cmd {
@@ -136,12 +180,17 @@ class FlushallCmd : public Cmd {
   FlushallCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new FlushallCmd(*this);
+  }
 
  private:
   virtual void DoInitial() override;
   virtual std::string ToBinlog(
       uint32_t exec_time,
-      const std::string& server_id,
+      uint32_t term_id,
       uint64_t logic_id,
       uint32_t filenum,
       uint64_t offset) override;
@@ -152,6 +201,11 @@ class FlushdbCmd : public Cmd {
   FlushdbCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new FlushdbCmd(*this);
+  }
 
  private:
   std::string db_name_;
@@ -168,9 +222,14 @@ class ClientCmd : public Cmd {
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
   const static std::string CLIENT_LIST_S;
   const static std::string CLIENT_KILL_S;
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new ClientCmd(*this);
+  }
 
  private:
-  std::string operation_, ip_port_;
+  std::string operation_, info_;
   virtual void DoInitial() override;
 };
 
@@ -195,6 +254,11 @@ class InfoCmd : public Cmd {
   InfoCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag), rescan_(false), off_(false) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new InfoCmd(*this);
+  }
 
  private:
   InfoSection info_section_;
@@ -238,6 +302,11 @@ class ShutdownCmd : public Cmd {
   ShutdownCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new ShutdownCmd(*this);
+  }
 
  private:
   virtual void DoInitial() override;
@@ -248,6 +317,11 @@ class ConfigCmd : public Cmd {
   ConfigCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new ConfigCmd(*this);
+  }
 
  private:
   std::vector<std::string> config_args_v_;
@@ -263,6 +337,11 @@ class MonitorCmd : public Cmd {
   MonitorCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new MonitorCmd(*this);
+  }
 
  private:
   virtual void DoInitial() override;
@@ -273,6 +352,11 @@ class DbsizeCmd : public Cmd {
   DbsizeCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new DbsizeCmd(*this);
+  }
 
  private:
   virtual void DoInitial() override;
@@ -283,6 +367,11 @@ class TimeCmd : public Cmd {
   TimeCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new TimeCmd(*this);
+  }
 
  private:
   virtual void DoInitial() override;
@@ -293,6 +382,11 @@ class DelbackupCmd : public Cmd {
   DelbackupCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new DelbackupCmd(*this);
+  }
 
  private:
   virtual void DoInitial() override;
@@ -303,6 +397,11 @@ class EchoCmd : public Cmd {
   EchoCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new EchoCmd(*this);
+  }
 
  private:
   std::string body_;
@@ -314,6 +413,11 @@ class ScandbCmd : public Cmd {
   ScandbCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag), type_(blackwidow::kAll) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new ScandbCmd(*this);
+  }
 
  private:
   blackwidow::DataType type_;
@@ -329,6 +433,11 @@ class SlowlogCmd : public Cmd {
   SlowlogCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag), condition_(kGET) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new SlowlogCmd(*this);
+  }
  private:
   int64_t number_;
   SlowlogCmd::SlowlogCondition condition_;
@@ -344,12 +453,17 @@ class PaddingCmd : public Cmd {
   PaddingCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new PaddingCmd(*this);
+  }
 
  private:
   virtual void DoInitial();
   virtual std::string ToBinlog(
       uint32_t exec_time,
-      const std::string& server_id,
+      uint32_t term_id,
       uint64_t logic_id,
       uint32_t filenum,
       uint64_t offset) override;
@@ -361,6 +475,11 @@ class TcmallocCmd : public Cmd {
   TcmallocCmd(const std::string& name, int arity, uint16_t flag)
       : Cmd(name, arity, flag) {}
   virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new TcmallocCmd(*this);
+  }
 
  private:
   int64_t type_;
@@ -368,4 +487,38 @@ class TcmallocCmd : public Cmd {
   virtual void DoInitial() override;
 };
 #endif
+
+class PKPatternMatchDelCmd : public Cmd {
+ public: 
+  PKPatternMatchDelCmd(const std::string& name, int arity, uint16_t flag)
+      : Cmd(name, arity, flag) {}
+  virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new PKPatternMatchDelCmd(*this);
+  } 
+
+ private:
+  blackwidow::DataType type_;
+  std::string pattern_; 
+  virtual void DoInitial() override;
+};
+
+class DummyCmd : public Cmd {
+ public:
+  DummyCmd() : Cmd("", 0, 0) {}
+  DummyCmd(const std::string& name, int arity, uint16_t flag)
+     : Cmd(name, arity, flag) {}
+  virtual void Do(std::shared_ptr<Partition> partition = nullptr);
+  virtual void Split(std::shared_ptr<Partition> partition, const HintKeys& hint_keys) {};
+  virtual void Merge() {};
+  virtual Cmd* Clone() override {
+    return new DummyCmd(*this);
+  }
+
+ private:
+  virtual void DoInitial() override;
+};
+
 #endif  // PIKA_ADMIN_H_

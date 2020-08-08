@@ -55,25 +55,88 @@ slash::Status PikaReplServer::SendSlaveBinlogChips(const std::string& ip,
                                                    int port,
                                                    const std::vector<WriteTask>& tasks) {
   InnerMessage::InnerResponse response;
-  response.set_code(InnerMessage::kOk);
-  response.set_type(InnerMessage::Type::kBinlogSync);
-  for (const auto task :tasks) {
-    InnerMessage::InnerResponse::BinlogSync* binlog_sync = response.add_binlog_sync();
-    binlog_sync->set_session_id(task.rm_node_.SessionId());
-    InnerMessage::Partition* partition = binlog_sync->mutable_partition();
-    partition->set_table_name(task.rm_node_.TableName());
-    partition->set_partition_id(task.rm_node_.PartitionId());
-    InnerMessage::BinlogOffset* boffset = binlog_sync->mutable_binlog_offset();
-    boffset->set_filenum(task.binlog_chip_.offset_.filenum);
-    boffset->set_offset(task.binlog_chip_.offset_.offset);
-    binlog_sync->set_binlog(task.binlog_chip_.binlog_);
-  }
+  BuildBinlogSyncResp(tasks, &response);
 
   std::string binlog_chip_pb;
   if (!response.SerializeToString(&binlog_chip_pb)) {
     return Status::Corruption("Serialized Failed");
   }
+
+  if (binlog_chip_pb.size() > static_cast<size_t>(g_pika_conf->max_conn_rbuf_size())) {
+    for (const auto& task : tasks) {
+      InnerMessage::InnerResponse response;
+      std::vector<WriteTask> tmp_tasks;
+      tmp_tasks.push_back(task);
+      BuildBinlogSyncResp(tmp_tasks, &response);
+      if (!response.SerializeToString(&binlog_chip_pb)) {
+        return Status::Corruption("Serialized Failed");
+      }
+      slash::Status s = Write(ip, port, binlog_chip_pb);
+      if (!s.ok()) {
+        return s;
+      }
+    }
+    return slash::Status::OK();
+  }
   return Write(ip, port, binlog_chip_pb);
+}
+
+void PikaReplServer::BuildBinlogOffset(const LogOffset& offset,
+    InnerMessage::BinlogOffset* boffset) {
+  boffset->set_filenum(offset.b_offset.filenum);
+  boffset->set_offset(offset.b_offset.offset);
+  boffset->set_term(offset.l_offset.term);
+  boffset->set_index(offset.l_offset.index);
+}
+
+void PikaReplServer::BuildBinlogSyncResp(const std::vector<WriteTask>& tasks,
+    InnerMessage::InnerResponse* response) {
+  response->set_code(InnerMessage::kOk);
+  response->set_type(InnerMessage::Type::kBinlogSync);
+  LogOffset prev_offset;
+  bool founded = false;
+  for (const auto& task :tasks) {
+    if (!task.binlog_chip_.binlog_.empty() && !founded) {
+      // find the first not keepalive prev_offset
+      prev_offset = task.prev_offset_;
+      founded = true;
+    }
+    InnerMessage::InnerResponse::BinlogSync* binlog_sync = response->add_binlog_sync();
+    binlog_sync->set_session_id(task.rm_node_.SessionId());
+    InnerMessage::Partition* partition = binlog_sync->mutable_partition();
+    partition->set_table_name(task.rm_node_.TableName());
+    partition->set_partition_id(task.rm_node_.PartitionId());
+    InnerMessage::BinlogOffset* boffset = binlog_sync->mutable_binlog_offset();
+    BuildBinlogOffset(task.binlog_chip_.offset_, boffset);
+    binlog_sync->set_binlog(task.binlog_chip_.binlog_);
+  }
+  if (g_pika_conf->consensus_level() > 0) {
+    PartitionInfo p_info;
+    if (!tasks.empty()) {
+      p_info = tasks[0].rm_node_.NodePartitionInfo();
+    } else {
+      LOG(WARNING) << "Task size is zero";
+      return;
+    }
+
+    // write consensus_meta
+    InnerMessage::ConsensusMeta* consensus_meta
+      = response->mutable_consensus_meta();
+    InnerMessage::BinlogOffset* last_log = consensus_meta->mutable_log_offset();
+    BuildBinlogOffset(prev_offset, last_log);
+    // commit
+    LogOffset committed_index;
+    std::shared_ptr<SyncMasterPartition> partition =
+      g_pika_rm->GetSyncMasterPartitionByName(p_info);
+    if (!partition) {
+      LOG(WARNING) << "SyncPartition " << p_info.ToString() << " Not Found.";
+      return;
+    }
+    committed_index = partition->ConsensusCommittedIndex();
+    InnerMessage::BinlogOffset* committed = consensus_meta->mutable_commit();
+    BuildBinlogOffset(committed_index, committed);
+    consensus_meta->set_term(partition->ConsensusTerm());
+  }
 }
 
 slash::Status PikaReplServer::Write(const std::string& ip,

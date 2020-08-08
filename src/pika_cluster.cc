@@ -14,6 +14,7 @@ extern PikaServer* g_pika_server;
 extern PikaConf* g_pika_conf;
 
 const std::string PkClusterInfoCmd::kSlotSection = "slot";
+const std::string PkClusterInfoCmd::kTableSection = "table";
 
 // pkcluster info slot table:slot
 // pkcluster info table
@@ -33,6 +34,11 @@ void PkClusterInfoCmd::DoInitial() {
     if (!ParseInfoSlotSubCmd()) {
       return;
     }
+  } else if (!strcasecmp(argv_[2].data(), kTableSection.data())) {
+    info_section_ = kInfoTable;
+    if (!ParseInfoTableSubCmd()) {
+      return;
+    }
   } else {
     info_section_ = kInfoErr;
   }
@@ -45,11 +51,17 @@ void PkClusterInfoCmd::Do(std::shared_ptr<Partition> partition) {
     case kInfoSlot:
       if (info_range_ == kAll) {
         ClusterInfoSlotAll(&info);
-      } else if (info_range_ == kSingle) {
+      } else if (info_range_ == kRange) {
         // doesn't process error, if error return nothing
-        GetSlotInfo(table_name_, partition_id_, &info);
+        ClusterInfoSlotRange(table_name_, slots_, &info);
       }
       break;
+    case kInfoTable:
+      if (info_range_ == kAll) {
+        ClusterInfoTableAll(&info);
+      } else if (info_range_ == kSingle) {
+        ClusterInfoTable(&info);
+      }
     default:
       break;
   }
@@ -58,10 +70,46 @@ void PkClusterInfoCmd::Do(std::shared_ptr<Partition> partition) {
   return;
 }
 
+void PkClusterInfoCmd::ClusterInfoTableAll(std::string* info) {
+  std::stringstream tmp_stream;
+  std::vector<TableStruct> table_structs = g_pika_conf->table_structs();
+  std::unordered_map<std::string, QpsStatistic> table_stat = g_pika_server->ServerAllTableStat();
+  for (const auto& table_struct : table_structs) {
+    std::string table_id = table_struct.table_name.substr(2);
+    tmp_stream << "table_id: " << table_id << "\r\n";
+    tmp_stream << "  partition_num: " << table_struct.partition_num << "\r\n";
+    QpsStatistic qps = table_stat[table_struct.table_name];
+    tmp_stream << "  total_commands_processed:" << qps.querynum.load() << "\r\n";
+    tmp_stream << "  total_write_commands_processed:" << qps.write_querynum.load() << "\r\n";
+    tmp_stream << "  qps: " << qps.last_sec_querynum << "\r\n";
+    tmp_stream << "  write_qps: " << qps.last_sec_write_querynum << "\r\n";
+    tmp_stream << "  read_qps: " << qps.last_sec_querynum - qps.last_sec_write_querynum << "\r\n";
+  }
+  info->append(tmp_stream.str());
+}
+
+void PkClusterInfoCmd::ClusterInfoTable(std::string* info) {
+  std::stringstream tmp_stream;
+  std::vector<TableStruct> table_structs = g_pika_conf->table_structs();
+  for (const auto& table_struct : table_structs) {
+    if (table_struct.table_name == table_name_) {
+      std::string table_id = table_struct.table_name.substr(2);
+      tmp_stream << "table_id: " << table_id << "\r\n";
+      tmp_stream << "  partition_num: " << table_struct.partition_num << "\r\n";
+      QpsStatistic qps = g_pika_server->ServerTableStat(table_name_);
+      tmp_stream << "  qps: " << qps.last_sec_querynum << "\r\n";
+      tmp_stream << "  write_qps: " << qps.last_sec_write_querynum << "\r\n";
+      tmp_stream << "  read_qps: " << qps.last_sec_querynum - qps.last_sec_write_querynum << "\r\n";
+      break;
+    }
+  }
+  info->append(tmp_stream.str());
+}
+
 bool PkClusterInfoCmd::ParseInfoSlotSubCmd() {
   if (argv_.size() > 3) {
     if (argv_.size() == 4) {
-      info_range_ = kSingle;
+      info_range_ = kRange;
       std::string tmp(argv_[3]);
       size_t pos = tmp.find(':');
       std::string slot_num_str;
@@ -72,18 +120,49 @@ bool PkClusterInfoCmd::ParseInfoSlotSubCmd() {
         table_name_ = tmp.substr(0, pos);
         slot_num_str = tmp.substr(pos + 1);
       }
-      unsigned long partition_id;
-      if (!slash::string2ul(slot_num_str.c_str(), slot_num_str.size(), &partition_id)) {
+      if (!ParseSlotGroup(slot_num_str, &slots_).ok()) {
         res_.SetRes(CmdRes::kInvalidParameter, kCmdNamePkClusterInfo);
         return false;
       }
-      partition_id_ = partition_id;
     } else {
       res_.SetRes(CmdRes::kWrongNum, kCmdNamePkClusterInfo);
       return false;
     }
   }
   return true;
+}
+
+bool PkClusterInfoCmd::ParseInfoTableSubCmd() {
+  if (argv_.size() == 3) {
+    info_range_ = kAll;
+  } else if (argv_.size() == 4) {
+    std::string tmp(argv_[3]);
+    uint64_t table_id;
+    if (!slash::string2ul(tmp.c_str(), tmp.size(), &table_id)) {
+      res_.SetRes(CmdRes::kInvalidParameter, kCmdNamePkClusterInfo);
+      return false;
+    }
+    table_name_ = "db" + tmp;
+    info_range_ = kSingle;
+  } else if (argv_.size() > 4) {
+    res_.SetRes(CmdRes::kWrongNum, kCmdNamePkClusterInfo);
+    return false;
+  }
+  return true;
+}
+
+void PkClusterInfoCmd::ClusterInfoSlotRange(const std::string& table_name,
+    const std::set<uint32_t> slots, std::string* info) {
+  std::stringstream tmp_stream;
+  for (auto partition_id : slots) {
+    std::string p_info;
+    Status s = GetSlotInfo(table_name, partition_id, &p_info);
+    if (!s.ok()) {
+      continue;
+    }
+    tmp_stream << p_info;
+  }
+  info->append(tmp_stream.str());
 }
 
 void PkClusterInfoCmd::ClusterInfoSlotAll(std::string* info) {
@@ -107,8 +186,8 @@ void PkClusterInfoCmd::ClusterInfoSlotAll(std::string* info) {
 Status PkClusterInfoCmd::GetSlotInfo(const std::string table_name,
                                      uint32_t partition_id,
                                      std::string* info) {
-  std::shared_ptr<Partition> partition =
-    g_pika_server->GetTablePartitionById(table_name, partition_id);
+  std::shared_ptr<SyncMasterPartition> partition =
+    g_pika_rm->GetSyncMasterPartitionByName(PartitionInfo(table_name, partition_id));
   if (!partition) {
     return Status::NotFound("not found");
   }
@@ -118,14 +197,27 @@ Status PkClusterInfoCmd::GetSlotInfo(const std::string table_name,
   // binlog offset section
   uint32_t filenum = 0;
   uint64_t offset = 0;
-  partition->logger()->GetProducerStatus(&filenum, &offset);
-  tmp_stream << partition->GetPartitionName() << " binlog_offset="
+  partition->Logger()->GetProducerStatus(&filenum, &offset);
+  tmp_stream << partition->PartitionName() << " binlog_offset="
     << filenum << " " << offset;
 
   // safety purge section
   std::string safety_purge;
-  s = g_pika_rm->GetSafetyPurgeBinlogFromSMP(table_name, partition_id, &safety_purge);
+  std::shared_ptr<SyncMasterPartition> master_partition =
+      g_pika_rm->GetSyncMasterPartitionByName(PartitionInfo(table_name, partition_id));
+  if (!master_partition) {
+    LOG(WARNING) << "Sync Master Partition: " << table_name << ":" << partition_id
+        << ", NotFound";
+    s = Status::NotFound("SyncMasterPartition NotFound");
+  } else {
+    master_partition->GetSafetyPurgeBinlog(&safety_purge);
+  }
   tmp_stream << ",safety_purge=" << (s.ok() ? safety_purge : "error") << "\r\n";
+
+  if (g_pika_conf->consensus_level()) {
+    LogOffset last_log = master_partition->ConsensusLastIndex();
+    tmp_stream << "  consensus_last_log=" << last_log.ToString() << "\r\n";
+  }
 
   // partition info section
   std::string p_info;
@@ -188,10 +280,22 @@ void SlotParentCmd::DoInitial() {
   if (!s.ok()) {
     res_.SetRes(CmdRes::kErrOther, s.ToString());
   }
-
-  std::string table_name = g_pika_conf->default_table();
+  if (argv_.size() == 3) {
+    table_name_ = g_pika_conf->default_table();
+  } else if (argv_.size() == 4) {
+    uint64_t table_id;
+    if (!slash::string2ul(argv_[3].data(), argv_[3].size(), &table_id)) {
+      res_.SetRes(CmdRes::kErrOther, "syntax error");
+      return;
+    }
+    table_name_ = "db";
+    table_name_ += std::to_string(table_id);
+  } else {
+    res_.SetRes(CmdRes::kSyntaxErr, "too many argument");
+    return;
+  }
   for (const auto& slot_id : slots_) {
-    p_infos_.insert(PartitionInfo(table_name, slot_id));
+    p_infos_.insert(PartitionInfo(table_name_, slot_id));
   }
 }
 
@@ -208,8 +312,7 @@ void PkClusterAddSlotsCmd::DoInitial() {
 }
 
 void PkClusterAddSlotsCmd::Do(std::shared_ptr<Partition> partition) {
-  std::string table_name = g_pika_conf->default_table();
-  std::shared_ptr<Table> table_ptr = g_pika_server->GetTable(table_name);
+  std::shared_ptr<Table> table_ptr = g_pika_server->GetTable(table_name_);
   if (!table_ptr) {
     res_.SetRes(CmdRes::kErrOther, "Internal error: table not found!");
     return;
@@ -224,29 +327,29 @@ void PkClusterAddSlotsCmd::Do(std::shared_ptr<Partition> partition) {
   }
 
   bool pre_success = true;
-  Status s = AddSlotsSanityCheck(table_name);
+  Status s = AddSlotsSanityCheck();
   if (!s.ok()) {
-    LOG(WARNING) << "Addslots sanity check failed";
+    LOG(WARNING) << "Addslots sanity check failed: " << s.ToString();
     pre_success = false;
   }
   if (pre_success) {
-    s = g_pika_conf->AddTablePartitions(table_name, slots_);
+    s = g_pika_conf->AddTablePartitions(table_name_, slots_);
     if (!s.ok()) {
-      LOG(WARNING) << "Addslots add to pika conf failed";
+      LOG(WARNING) << "Addslots add to pika conf failed: " << s.ToString();
       pre_success = false;
     }
   }
   if (pre_success) {
     s = table_ptr->AddPartitions(slots_);
     if (!s.ok()) {
-      LOG(WARNING) << "Addslots add to table partition failed";
+      LOG(WARNING) << "Addslots add to table partition failed: " << s.ToString();
       pre_success = false;
     }
   }
   if (pre_success) {
     s = g_pika_rm->AddSyncPartition(p_infos_);
     if (!s.ok()) {
-      LOG(WARNING) << "Addslots add to sync partition failed";
+      LOG(WARNING) << "Addslots add to sync partition failed: " << s.ToString();
       pre_success = false;
     }
   }
@@ -262,13 +365,13 @@ void PkClusterAddSlotsCmd::Do(std::shared_ptr<Partition> partition) {
   LOG(INFO) << "Pika meta file overwrite success";
 }
 
-Status PkClusterAddSlotsCmd::AddSlotsSanityCheck(const std::string& table_name) {
-  Status s = g_pika_conf->TablePartitionsSanityCheck(table_name, slots_, true);
+Status PkClusterAddSlotsCmd::AddSlotsSanityCheck() {
+  Status s = g_pika_conf->TablePartitionsSanityCheck(table_name_, slots_, true);
   if (!s.ok()) {
     return s;
   }
 
-  std::shared_ptr<Table> table_ptr = g_pika_server->GetTable(table_name);
+  std::shared_ptr<Table> table_ptr = g_pika_server->GetTable(table_name_);
   if (!table_ptr) {
     return Status::NotFound("table not found!");
   }
@@ -298,8 +401,7 @@ void PkClusterDelSlotsCmd::DoInitial() {
 }
 
 void PkClusterDelSlotsCmd::Do(std::shared_ptr<Partition> partition) {
-  std::string table_name = g_pika_conf->default_table();
-  std::shared_ptr<Table> table_ptr = g_pika_server->GetTable(table_name);
+  std::shared_ptr<Table> table_ptr = g_pika_server->GetTable(table_name_);
   if (!table_ptr) {
     res_.SetRes(CmdRes::kErrOther, "Internal error: default table not found!");
     return;
@@ -314,29 +416,30 @@ void PkClusterDelSlotsCmd::Do(std::shared_ptr<Partition> partition) {
   }
 
   bool pre_success = true;
-  Status s = RemoveSlotsSanityCheck(table_name);
+  Status s = RemoveSlotsSanityCheck();
   if (!s.ok()) {
-    LOG(WARNING) << "Removeslots sanity check failed";
+    LOG(WARNING) << "Removeslots sanity check failed: " << s.ToString();
     pre_success = false;
   }
+  // remove order maters
   if (pre_success) {
-    s = g_pika_conf->RemoveTablePartitions(table_name, slots_);
+    s = g_pika_conf->RemoveTablePartitions(table_name_, slots_);
     if (!s.ok()) {
-      LOG(WARNING) << "Removeslots remove from pika conf failed";
-      pre_success = false;
-    }
-  }
-  if (pre_success) {
-    s = table_ptr->RemovePartitions(slots_);
-    if (!s.ok()) {
-      LOG(WARNING) << "Removeslots remove from table partition failed";
+      LOG(WARNING) << "Removeslots remove from pika conf failed: " << s.ToString();
       pre_success = false;
     }
   }
   if (pre_success) {
     s = g_pika_rm->RemoveSyncPartition(p_infos_);
     if (!s.ok()) {
-      LOG(WARNING) << "Remvoeslots remove from sync partition failed";
+      LOG(WARNING) << "Remvoeslots remove from sync partition failed: " << s.ToString();
+      pre_success = false;
+    }
+  }
+  if (pre_success) {
+    s = table_ptr->RemovePartitions(slots_);
+    if (!s.ok()) {
+      LOG(WARNING) << "Removeslots remove from table partition failed: " << s.ToString();
       pre_success = false;
     }
   }
@@ -351,13 +454,13 @@ void PkClusterDelSlotsCmd::Do(std::shared_ptr<Partition> partition) {
   LOG(INFO) << "Pika meta file overwrite success";
 }
 
-Status PkClusterDelSlotsCmd::RemoveSlotsSanityCheck(const std::string& table_name) {
-  Status s = g_pika_conf->TablePartitionsSanityCheck(table_name, slots_, false);
+Status PkClusterDelSlotsCmd::RemoveSlotsSanityCheck() {
+  Status s = g_pika_conf->TablePartitionsSanityCheck(table_name_, slots_, false);
   if (!s.ok()) {
     return s;
   }
 
-  std::shared_ptr<Table> table_ptr = g_pika_server->GetTable(table_name);
+  std::shared_ptr<Table> table_ptr = g_pika_server->GetTable(table_name_);
   if (!table_ptr) {
     return Status::NotFound("table not found");
   }
@@ -375,9 +478,10 @@ Status PkClusterDelSlotsCmd::RemoveSlotsSanityCheck(const std::string& table_nam
   return Status::OK();
 }
 
-/* pkcluster slotsslaveof no one  [0-3,8-11 | all]
- * pkcluster slotsslaveof ip port [0-3,8,9,10,11 | all]
+/* pkcluster slotsslaveof no one  [0-3,8-11 | all] [table_id]
+ * pkcluster slotsslaveof ip port [0-3,8,9,10,11 | all] [table_id]
  * pkcluster slotsslaveof ip port [0,2,4,6,7,8,9 | all] force
+ * pkcluster slotsslaveof ip port [0,2,4,6,7,8,9 | all] force [table_id]
  */
 void PkClusterSlotsSlaveofCmd::DoInitial() {
   if (!CheckArg(argv_.size())) {
@@ -407,9 +511,10 @@ void PkClusterSlotsSlaveofCmd::DoInitial() {
     }
   }
 
+  bool all_slots = false;
   if (!strcasecmp(argv_[4].data(), "all")) {
-    std::string table_name = g_pika_conf->default_table();
-    slots_ = g_pika_server->GetTablePartitionIds(table_name);
+    // not know which table yet
+    all_slots = true;
   } else {
     Status s = ParseSlotGroup(argv_[4], &slots_);
     if (!s.ok()) {
@@ -418,27 +523,59 @@ void PkClusterSlotsSlaveofCmd::DoInitial() {
     }
   }
 
-  if (slots_.empty()) {
-    res_.SetRes(CmdRes::kErrOther, "Slots set empty");
+  uint64_t table_id;
+  switch (argv_.size()) {
+    case 5:
+      table_name_ = g_pika_conf->default_table();
+      break;
+    case 6:
+      if (!strcasecmp(argv_[5].data(), "force")) {
+        force_sync_ = true;
+        table_name_ = g_pika_conf->default_table();
+      } else if (slash::string2ul(argv_[5].data(), argv_[5].size(), &table_id)) {
+        table_name_ = "db";
+        table_name_ += std::to_string(table_id);
+      } else {
+        res_.SetRes(CmdRes::kErrOther, "syntax error");
+        return;
+      }
+      break;
+    case 7:
+      if ((!strcasecmp(argv_[5].data(), "force"))
+          && (slash::string2ul(argv_[6].data(), argv_[6].size(), &table_id))) {
+        force_sync_ = true;
+        table_name_ = "db";
+        table_name_ += std::to_string(table_id);
+      } else {
+        res_.SetRes(CmdRes::kErrOther, "syntax error");
+        return;
+      }
+      break;
+    default:
+      res_.SetRes(CmdRes::kErrOther, "syntax error");
+      return;
   }
 
-  if (argv_.size() == 5) {
-    // do nothing
-  } else if (argv_.size() == 6
-    && !strcasecmp(argv_[5].data(), "force")) {
-    force_sync_ = true;
-  } else {
-    res_.SetRes(CmdRes::kSyntaxErr);
+  if (!g_pika_server->IsTableExist(table_name_)) {
+    res_.SetRes(CmdRes::kInvalidTable);
+    return;
+  }
+
+  if (all_slots) {
+    slots_ = g_pika_server->GetTablePartitionIds(table_name_);
+  }
+
+  if (slots_.empty()) {
+    res_.SetRes(CmdRes::kErrOther, "Slots set empty");
   }
 }
 
 void PkClusterSlotsSlaveofCmd::Do(std::shared_ptr<Partition> partition) {
-  std::string table_name = g_pika_conf->default_table();
   std::vector<uint32_t> to_del_slots;
   for (const auto& slot : slots_) {
     std::shared_ptr<SyncSlavePartition> slave_partition =
         g_pika_rm->GetSyncSlavePartitionByName(
-                PartitionInfo(table_name, slot));
+                PartitionInfo(table_name_, slot));
     if (!slave_partition) {
       res_.SetRes(CmdRes::kErrOther, "Slot " + std::to_string(slot) + " not found!");
       return;
@@ -461,25 +598,21 @@ void PkClusterSlotsSlaveofCmd::Do(std::shared_ptr<Partition> partition) {
   for (const auto& slot : slots_) {
     std::shared_ptr<SyncSlavePartition> slave_partition =
         g_pika_rm->GetSyncSlavePartitionByName(
-                PartitionInfo(table_name, slot));
+                PartitionInfo(table_name_, slot));
     if (slave_partition->State() == ReplState::kConnected) {
-      s = g_pika_rm->SendRemoveSlaveNodeRequest(table_name, slot);
+      s = g_pika_rm->SendRemoveSlaveNodeRequest(table_name_, slot);
     }
     if (!s.ok()) {
       break;
     }
     if (slave_partition->State() != ReplState::kNoConnect) {
       // reset state
-      s = g_pika_rm->SetSlaveReplState(
-          PartitionInfo(table_name, slot), ReplState::kNoConnect);
-      if (!s.ok()) {
-        break;
-      }
+      slave_partition->SetReplState(ReplState::kNoConnect);
     }
     if (is_noone_) {
     } else {
       s = g_pika_rm->ActivateSyncSlavePartition(
-          RmNode(ip_, port_, table_name, slot), state);
+          RmNode(ip_, port_, table_name_, slot), state);
       if (!s.ok()) {
         break;
       }
@@ -493,3 +626,188 @@ void PkClusterSlotsSlaveofCmd::Do(std::shared_ptr<Partition> partition) {
   }
 }
 
+/*
+ * pkcluster addtable table_id slot_num
+ * pkcluster addtable 1 1024
+ */
+void PkClusterAddTableCmd::DoInitial() {
+  if (!CheckArg(argv_.size())) {
+    res_.SetRes(CmdRes::kSyntaxErr);
+    return;
+  }
+  if (g_pika_conf->classic_mode()) {
+    res_.SetRes(CmdRes::kErrOther, "PkClusterTable Cmd only support on sharding mode");
+    return;
+  }
+  uint64_t table_id;
+  if (!slash::string2ul(argv_[2].data(), argv_[2].size(), &table_id)) {
+    res_.SetRes(CmdRes::kErrOther, "syntax error");
+    return;
+  }
+  table_name_ = "db";
+  table_name_ += std::to_string(table_id);
+  if (!slash::string2ul(argv_[3].data(), argv_[3].size(), &slot_num_)
+      || slot_num_ == 0) {
+    res_.SetRes(CmdRes::kErrOther, "syntax error");
+    return;
+  }
+}
+
+void PkClusterAddTableCmd::Do(std::shared_ptr<Partition> partition) {
+  std::shared_ptr<Table> table_ptr = g_pika_server->GetTable(table_name_);
+  if (table_ptr) {
+    res_.SetRes(CmdRes::kErrOther, "Internal error: table already exist!");
+    return;
+  }
+
+  SlotState expected = INFREE;
+  if (!std::atomic_compare_exchange_strong(&g_pika_server->slot_state_,
+                                           &expected, INBUSY)) {
+    res_.SetRes(CmdRes::kErrOther,
+                "Table/Slot in syncing or a change operation is under way, retry later");
+    return;
+  }
+
+  bool pre_success = true;
+  Status s = AddTableSanityCheck();
+  if (!s.ok()) {
+    LOG(WARNING) << "AddTable sanity check failed: " << s.ToString();
+    pre_success = false;
+  }
+  if (pre_success) {
+    s = g_pika_conf->AddTable(table_name_,slot_num_);
+    if (!s.ok()) {
+      LOG(WARNING) << "Addslots add to pika conf failed: " << s.ToString();
+      pre_success = false;
+    }
+  }
+  if (pre_success) {
+    s = g_pika_server->AddTableStruct(table_name_,slot_num_);
+    if (!s.ok()) {
+      LOG(WARNING) << "Addslots add to pika conf failed: " << s.ToString();
+      pre_success = false;
+    }
+  }
+
+  g_pika_server->slot_state_.store(INFREE);
+
+  if (!pre_success) {
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
+    return;
+  }
+  res_.SetRes(CmdRes::kOk);
+  LOG(INFO) << "Pika meta file overwrite success";
+}
+
+Status PkClusterAddTableCmd::AddTableSanityCheck() {
+  Status s  = g_pika_conf->AddTableSanityCheck(table_name_);
+  if (!s.ok()) {
+    return s;
+  }
+  std::shared_ptr<Table> table_ptr = g_pika_server->GetTable(table_name_);
+  if (table_ptr) {
+    return Status::Corruption("table already exist!");
+  }
+  s = g_pika_rm->SyncTableSanityCheck(table_name_);
+  return s;
+}
+
+/*
+ * pkcluster deltable table_id
+ */
+void PkClusterDelTableCmd::DoInitial() {
+  if (!CheckArg(argv_.size())) {
+    res_.SetRes(CmdRes::kSyntaxErr);
+    return;
+  }
+  if (g_pika_conf->classic_mode()) {
+    res_.SetRes(CmdRes::kErrOther, "PkClusterTable Cmd only support on sharding mode");
+    return;
+  }
+  uint64_t table_id;
+  if (!slash::string2ul(argv_[2].data(), argv_[2].size(), &table_id)) {
+    res_.SetRes(CmdRes::kErrOther, "syntax error");
+    return;
+  }
+  table_name_ = "db";
+  table_name_ +=  std::to_string(table_id);
+}
+
+
+void PkClusterDelTableCmd::Do(std::shared_ptr<Partition> partition) {
+  std::shared_ptr<Table> table_ptr = g_pika_server->GetTable(table_name_);
+  if (!table_ptr) {
+    res_.SetRes(CmdRes::kErrOther, "Internal error: table not found!");
+    return;
+  }
+
+  if (!table_ptr->TableIsEmpty()) {
+    table_ptr->GetAllPartitions(slots_);
+    for (const auto& slot_id : slots_) {
+      p_infos_.insert(PartitionInfo(table_name_, slot_id));
+    }
+    PkClusterDelSlotsCmd::Do();
+  }
+
+  SlotState expected = INFREE;
+  if (!std::atomic_compare_exchange_strong(&g_pika_server->slot_state_,
+                                           &expected, INBUSY)) {
+    res_.SetRes(CmdRes::kErrOther,
+                "Table/Slot in syncing or a change operation is under way, retry later");
+    return;
+  }
+
+  bool pre_success = true;
+  Status s = DelTableSanityCheck(table_name_);
+  if (!s.ok()) {
+    LOG(WARNING) << "DelTable sanity check failed: " << s.ToString();
+    pre_success = false;
+  }
+  // remove order maters
+  if (pre_success) {
+    s = g_pika_conf->DelTable(table_name_);
+    if (!s.ok()) {
+      LOG(WARNING) << "DelTable remove from pika conf failed: " << s.ToString();
+      pre_success = false;
+    }
+  }
+  if (pre_success) {
+    s = g_pika_rm->DelSyncTable(table_name_);
+    if (!s.ok()) {
+      LOG(WARNING) << "DelTable remove from pika rm failed: " << s.ToString();
+      pre_success = false;
+    }
+  }
+  if (pre_success) {
+    s = g_pika_server->DelTableStruct(table_name_);
+    if (!s.ok()) {
+      LOG(WARNING) << "DelTable remove from pika server failed: " << s.ToString();
+      pre_success = false;
+    }
+  }
+
+  g_pika_server->slot_state_.store(INFREE);
+
+  if (!pre_success) {
+    res_.SetRes(CmdRes::kErrOther, s.ToString());
+    return;
+  }
+  res_.SetRes(CmdRes::kOk);
+  LOG(INFO) << "Pika meta file overwrite success";
+}
+
+Status PkClusterDelTableCmd::DelTableSanityCheck(const std::string &table_name) {
+  Status s  = g_pika_conf->DelTableSanityCheck(table_name);
+  if (!s.ok()) {
+    return s;
+  }
+  std::shared_ptr<Table> table_ptr = g_pika_server->GetTable(table_name);
+  if (!table_ptr) {
+    return Status::Corruption("table not found!");
+  }
+  if (!table_ptr->TableIsEmpty()) {
+    return Status::Corruption("table have slots!");
+  }
+  s =  g_pika_rm->SyncTableSanityCheck(table_name);
+  return s;
+}
